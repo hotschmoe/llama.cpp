@@ -33,6 +33,7 @@ static void flush_all_dcache(struct htp_context * ctx) {
     hex_l2fetch_block(ctx, ctx->footprint);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_L2FLUSH, 0);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
+    ctx->dirty_hi = 0;
 }
 
 static void l2flush_multi_worker(unsigned int n, unsigned int i, void * data) {
@@ -94,6 +95,34 @@ static void merge_dirty_ranges(struct htp_context * ctx) {
     }
 }
 
+// Absorb every range that touches the range in slot k (called after slot k was inserted or grown)
+static void merge_into(struct htp_context * ctx, uint32_t k) {
+    struct htp_dirty_range * r = &ctx->dirty_ranges[k];
+
+    bool grew;
+    do {
+        grew = false;
+        for (uint32_t j = 0; j < ctx->dirty_hi; j++) {
+            struct htp_dirty_range * s = &ctx->dirty_ranges[j];
+            if (j == k || !s->start || r->end < s->start || s->end < r->start) {
+                continue;
+            }
+
+            r->start = MIN(r->start, s->start);
+            r->end   = MAX(r->end, s->end);
+            s->start = 0;
+            s->end   = 0;
+            grew     = true;
+        }
+    } while (grew);
+}
+
+static inline void dirty_touch_slot(struct htp_context * ctx, uint32_t idx) {
+    if (idx >= ctx->dirty_hi) {
+        ctx->dirty_hi = idx + 1;
+    }
+}
+
 void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
     const struct htp_tensor * pending[HTP_OP_MAX_OUTPUTS];
     uint32_t n_pending = 0;
@@ -107,30 +136,59 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
         uint32_t t_start = t->data;
         uint32_t t_end   = t_start + t->size;
 
-        bool merged = false;
-        for (uint32_t j = 0; j < HTP_MAX_DIRTY_RANGES; j++) {
-            struct htp_dirty_range * r = &ctx->dirty_ranges[j];
-            if (!r->start) continue;
-
-            if (r->start <= t_end && t_start <= r->end) {
-                uint32_t new_start = (t_start < r->start) ? t_start : r->start;
-                uint32_t new_end   = (t_end > r->end)     ? t_end   : r->end;
-                r->start = new_start;
-                r->end   = new_end;
-                merged   = true;
+        int32_t k = -1;
+        for (uint32_t j = 0; j < ctx->dirty_hi; j++) {
+            const struct htp_dirty_range * r = &ctx->dirty_ranges[j];
+            if (r->start && r->start <= t_end && t_start <= r->end) {
+                k = (int32_t) j;
+                break;
             }
         }
 
-        if (!merged) {
+        if (k >= 0) {
+            struct htp_dirty_range * r = &ctx->dirty_ranges[k];
+            r->start                   = MIN(r->start, t_start);
+            r->end                     = MAX(r->end, t_end);
+            merge_into(ctx, (uint32_t) k);
+        } else {
             pending[n_pending++] = t;
         }
     }
 
-    merge_dirty_ranges(ctx);
-
     if (n_pending == 0) {
         return;
     }
+
+    // place pending ranges into free slots (below or at the high-water mark)
+    uint32_t n_placed = 0;
+    while (n_placed < n_pending) {
+        uint32_t idx = ctx->dirty_hi;
+        for (uint32_t j = 0; j < ctx->dirty_hi; j++) {
+            if (!ctx->dirty_ranges[j].start) {
+                idx = j;
+                break;
+            }
+        }
+        if (idx >= HTP_MAX_DIRTY_RANGES) {
+            break;
+        }
+
+        struct htp_dirty_range * r = &ctx->dirty_ranges[idx];
+        r->start                   = pending[n_placed]->data;
+        r->end                     = pending[n_placed]->data + pending[n_placed]->size;
+        dirty_touch_slot(ctx, idx);
+        merge_into(ctx, idx);
+        n_placed++;
+    }
+
+    if (n_placed == n_pending) {
+        return;
+    }
+
+    for (uint32_t i = n_placed; i < n_pending; i++) {
+        pending[i - n_placed] = pending[i];
+    }
+    n_pending -= n_placed;
 
     uint32_t empty_indices[HTP_MAX_DIRTY_RANGES];
     uint32_t active_indices[HTP_MAX_DIRTY_RANGES];
@@ -142,17 +200,6 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
         } else {
             empty_indices[n_empty++]   = j;
         }
-    }
-
-    if (n_pending <= n_empty) {
-        for (uint32_t i = 0; i < n_pending; i++) {
-            uint32_t idx = empty_indices[i];
-            struct htp_dirty_range * r = &ctx->dirty_ranges[idx];
-            r->start = pending[i]->data;
-            r->end   = pending[i]->data + pending[i]->size;
-        }
-        merge_dirty_ranges(ctx);
-        return;
     }
 
     uint32_t n_evict = n_pending - n_empty;
@@ -169,6 +216,7 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
             struct htp_dirty_range * r = &ctx->dirty_ranges[i];
             r->start = pending[i]->data;
             r->end   = pending[i]->data + pending[i]->size;
+            dirty_touch_slot(ctx, i);
         }
         merge_dirty_ranges(ctx);
         return;
@@ -213,6 +261,7 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
         struct htp_dirty_range * r = &ctx->dirty_ranges[idx];
         r->start = pending[i]->data;
         r->end   = pending[i]->data + pending[i]->size;
+        dirty_touch_slot(ctx, idx);
     }
 
     for (uint32_t i = 0; i < n_empty; i++) {
@@ -220,6 +269,7 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
         struct htp_dirty_range * r = &ctx->dirty_ranges[idx];
         r->start = pending[n_evict + i]->data;
         r->end   = pending[n_evict + i]->data + pending[n_evict + i]->size;
+        dirty_touch_slot(ctx, idx);
     }
 
     merge_dirty_ranges(ctx);
@@ -233,7 +283,7 @@ static void make_tensor_clean(struct htp_context * ctx, const struct htp_tensor 
     uint32_t t_start = t->data;
     uint32_t t_end   = t_start + t->size;
 
-    for (uint32_t i = 0; i < HTP_MAX_DIRTY_RANGES; i++) {
+    for (uint32_t i = 0; i < ctx->dirty_hi; i++) {
         struct htp_dirty_range * r = &ctx->dirty_ranges[i];
         if (!r->start) continue;
 
@@ -258,7 +308,7 @@ static inline bool is_tensor_dirty(struct htp_context * ctx, const struct htp_te
     uint32_t t_start = t->data;
     uint32_t t_end   = t_start + t->size;
 
-    for (uint32_t i = 0; i < HTP_MAX_DIRTY_RANGES; i++) {
+    for (uint32_t i = 0; i < ctx->dirty_hi; i++) {
         struct htp_dirty_range * r = &ctx->dirty_ranges[i];
         if (!r->start) continue;
 
@@ -306,7 +356,7 @@ void htp_dcache_flush_dirty_ranges(struct htp_context * ctx) {
     uint32_t n_ranges = 0;
     uint64_t total_dirty = 0;
 
-    for (uint32_t i = 0; i < HTP_MAX_DIRTY_RANGES; i++) {
+    for (uint32_t i = 0; i < ctx->dirty_hi; i++) {
         const struct htp_dirty_range * r = &ctx->dirty_ranges[i];
         if (!r->start) {
             continue;
@@ -326,6 +376,7 @@ void htp_dcache_flush_dirty_ranges(struct htp_context * ctx) {
 
     flush_dirty_ranges(ctx, ranges, n_ranges, total_dirty);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
+    ctx->dirty_hi = 0;
 }
 
 void htp_dcache_flush_dirty_tensors(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
