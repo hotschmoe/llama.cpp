@@ -1283,15 +1283,15 @@ uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_tokens == ubatch.n_seqs_unq) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (ubatch.n_seq_id[i] != 1) {
-                return 1;
+                return 0;
             }
         }
 
         return ubatch.n_tokens;
     }
 
-    // cannot split into per-sequence slices - attend to the whole cache as one slice
-    return 1;
+    // cannot split into per-sequence slices - kv_rows are not supported for this batch
+    return 0;
 }
 
 uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv) const {
@@ -1299,12 +1299,18 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_k
         return 0;
     }
 
+    const uint32_t n_slices = get_n_kv_slices(ubatch);
+    if (n_slices == 0) {
+        // cannot split into per-sequence slices - kv_rows are not used
+        return 0;
+    }
+
     const auto & cells = v_cells[0];
 
     const uint32_t n_pad_cur = 256;
 
-    // a single slice attends to the whole cache (one sequence, or a batch that cannot split)
-    if (get_n_kv_slices(ubatch) == 1) {
+    // a single slice attends to the whole cache (one sequence)
+    if (n_slices == 1) {
         return std::min(n_kv, get_size());
     }
 
@@ -1856,18 +1862,6 @@ void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * u
     const auto & cells = v_cells[0];
 
     int32_t * data = (int32_t *) dst->data;
-
-    // a batch that cannot split into per-sequence slices attends to the whole cache
-    if (n_slices == 1 && ubatch->n_seqs_unq > 1) {
-        int32_t n = 0;
-        for (uint32_t i = 0; i < cells.size() && n < n_rows; ++i) {
-            if (!cells.is_empty(i)) {
-                data[n++] = (int32_t) i;
-            }
-        }
-        std::fill(data + n, data + n_rows, -1);
-        return;
-    }
 
     // seq id of each slice
     std::vector<llama_seq_id> seq_ids(n_slices);
