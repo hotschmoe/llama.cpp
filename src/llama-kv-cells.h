@@ -53,8 +53,6 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
-
-        seq_cells_ok.reset();
     }
 
     void reset_shift() {
@@ -379,24 +377,36 @@ public:
         return seq_pos[seq_id].size();
     }
 
-    // the cells that contain seq_id, in no particular order
-    const std::vector<int32_t> & seq_cells(llama_seq_id seq_id) const {
-        assert(seq_id >= 0);
-        assert(seq_id < LLAMA_MAX_SEQ);
+    // fill the rows of a flash attention K/V row list
+    // for each slice s: the cells of seq_ids[s], padded with -1
+    void set_input_kv_rows(
+        int32_t * data,
+        int64_t  n_rows,
+        const std::vector<llama_seq_id> & seq_ids
+    ) const {
+        assert(seq_ids.size() >= 1);
 
-        auto & res = seq_cells_list[seq_id];
+        const int64_t n_slices = (int64_t) seq_ids.size();
 
-        if (!seq_cells_ok.test(seq_id)) {
-            res.clear();
-            res.reserve(seq_pos[seq_id].size());
-            for (const auto & [p, i] : seq_pos[seq_id]) {
-                res.push_back(i);
+        // single loop over cells: each cell goes to the slices of the batch seqs it belongs to
+        const uint32_t n_cells_total = size();
+        std::vector<int32_t> n_cells(n_slices, 0);
+
+        for (uint32_t i = 0; i < n_cells_total; ++i) {
+            if (is_empty(i)) continue;
+
+            for (int64_t s = 0; s < n_slices; ++s) {
+                if (seq_has(i, seq_ids[s])) {
+                    assert(n_cells[s] < n_rows);
+                    data[s*n_rows + n_cells[s]++] = (int32_t) i;
+                }
             }
-
-            seq_cells_ok.set(seq_id);
         }
 
-        return res;
+        // pad the remaining slots of each slice with -1
+        for (int64_t s = 0; s < n_slices; ++s) {
+            std::fill(data + s*n_rows + n_cells[s], data + (s+1)*n_rows, -1);
+        }
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
@@ -562,39 +572,16 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
-    // flat copy of the cells of each seq for fast iteration: new cells are appended, a removal rebuilds it on the next use
-    mutable std::vector<int32_t>    seq_cells_list[LLAMA_MAX_SEQ];
-    mutable std::bitset<LLAMA_MAX_SEQ> seq_cells_ok;
-
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
-
-        // recently added cells are removed often (f.ex. prepare() reverts a trial apply), look for them near the end
-        if (seq_cells_ok.test(s)) {
-            auto & list = seq_cells_list[s];
-
-            const size_t n_search = std::min<size_t>(list.size(), 4096);
-            for (size_t k = 0; k < n_search; ++k) {
-                if (list[list.size() - 1 - k] == (int32_t) i) {
-                    list.erase(list.end() - 1 - k);
-                    return;
-                }
-            }
-
-            seq_cells_ok.reset(s);
-        }
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
-
-        if (seq_cells_ok.test(s)) {
-            seq_cells_list[s].push_back(i);
-        }
     }
 
     // remove cell i

@@ -1869,15 +1869,13 @@ void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * u
         return;
     }
 
+    // seq id of each slice
+    std::vector<llama_seq_id> seq_ids(n_slices);
     for (int64_t s = 0; s < n_slices; ++s) {
-        int32_t * rows = data + s*n_rows;
-
-        const auto & cells_seq = cells.seq_cells(ubatch->seq_id[s*n_tps][0]);
-        GGML_ASSERT((int64_t) cells_seq.size() <= n_rows);
-
-        std::copy(cells_seq.begin(), cells_seq.end(), rows);
-        std::fill(rows + cells_seq.size(), rows + n_rows, -1);
+        seq_ids[s] = ubatch->seq_id[s*n_tps][0];
     }
+
+    cells.set_input_kv_rows(data, n_rows, seq_ids);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
