@@ -377,35 +377,31 @@ public:
         return seq_pos[seq_id].size();
     }
 
-    // fill the rows of a flash attention K/V row list
-    // for each slice s: the cells of seq_ids[s], padded with -1
-    void set_input_kv_rows(
-        int32_t * data,
-        int64_t  n_rows,
-        const std::vector<llama_seq_id> & seq_ids
-    ) const {
+    // get the lists of cells of sequence seq_id
+    // one list of max `n_per_seq` for each seq_id, padded with -1
+    void get_seq_cells(const std::vector<llama_seq_id> & seq_ids, int32_t * data, int64_t n_per_seq) const {
         assert(seq_ids.size() >= 1);
 
         const int64_t n_slices = (int64_t) seq_ids.size();
 
-        // single loop over cells: each cell goes to the slices of the batch seqs it belongs to
         const uint32_t n_cells_total = size();
         std::vector<int32_t> n_cells(n_slices, 0);
 
         for (uint32_t i = 0; i < n_cells_total; ++i) {
-            if (is_empty(i)) continue;
+            if (is_empty(i)) {
+                continue;
+            }
 
             for (int64_t s = 0; s < n_slices; ++s) {
                 if (seq_has(i, seq_ids[s])) {
-                    assert(n_cells[s] < n_rows);
-                    data[s*n_rows + n_cells[s]++] = (int32_t) i;
+                    assert(n_cells[s] < n_per_seq);
+                    data[s*n_per_seq + n_cells[s]++] = (int32_t) i;
                 }
             }
         }
 
-        // pad the remaining slots of each slice with -1
         for (int64_t s = 0; s < n_slices; ++s) {
-            std::fill(data + s*n_rows + n_cells[s], data + (s+1)*n_rows, -1);
+            std::fill(data + s*n_per_seq + n_cells[s], data + (s+1)*n_per_seq, -1);
         }
     }
 

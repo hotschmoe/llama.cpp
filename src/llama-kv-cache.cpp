@@ -1869,7 +1869,8 @@ void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * u
         seq_ids[s] = ubatch->seq_id[s*n_tps][0];
     }
 
-    cells.set_input_kv_rows(data, n_rows, seq_ids);
+    // TODO: profile and optimize if necessary
+    cells.get_seq_cells(seq_ids, data, n_rows);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

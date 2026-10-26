@@ -194,6 +194,7 @@ public:
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each, 0 if it cannot (kv_rows not used)
+    // TODO: allow slices with coupled sequences
     static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
 
     // padded length of the cell list of each slice; 0 if the ubatch cannot split, a single slice attends to the whole cache

@@ -377,8 +377,17 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
 
     // resolved after flash attention, see resolve_fused_ops()
-    cparams.fused_kv_rows = false;
-    cparams.auto_fkvr     = cparams.kv_unified;
+    {
+        cparams.fused_kv_rows = false;
+
+        const char * LLAMA_KV_ROWS_ENABLE = getenv("LLAMA_KV_ROWS_ENABLE");
+        if (LLAMA_KV_ROWS_ENABLE) {
+            cparams.auto_fkvr = cparams.kv_unified;
+        } else {
+            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_ENABLE not set, defaulting to dense attention\n", __func__);
+            cparams.auto_fkvr = false;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
