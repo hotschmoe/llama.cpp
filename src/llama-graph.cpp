@@ -85,6 +85,7 @@ static bool can_reuse_kq_mask_rows(
     }
 
     const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
+    GGML_ASSERT(n_slices > 0);
 
     bool res = n_kv_rows > 0;
 

@@ -380,11 +380,11 @@ llama_context::llama_context(
     {
         cparams.fused_kv_rows = false;
 
-        const char * LLAMA_KV_ROWS_ENABLE = getenv("LLAMA_KV_ROWS_ENABLE");
-        if (LLAMA_KV_ROWS_ENABLE) {
+        const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
+        if (!LLAMA_KV_ROWS_DISABLE) {
             cparams.auto_fkvr = cparams.kv_unified;
         } else {
-            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_ENABLE not set, defaulting to dense attention\n", __func__);
+            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
         }
     }

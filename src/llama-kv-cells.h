@@ -384,10 +384,10 @@ public:
 
         const int64_t n_slices = (int64_t) seq_ids.size();
 
-        const uint32_t n_cells_total = size();
         std::vector<int32_t> n_cells(n_slices, 0);
 
-        for (uint32_t i = 0; i < n_cells_total; ++i) {
+        const uint32_t i_max = used_max_p1();
+        for (uint32_t i = 0; i < i_max; ++i) {
             if (is_empty(i)) {
                 continue;
             }
