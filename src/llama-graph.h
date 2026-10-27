@@ -371,9 +371,6 @@ public:
     // cells of the K/V views, the rows must stay inside them
     uint32_t n_kv = 0;
 
-    // false if the model reads the KQ mask of the whole cache itself
-    bool allow_kv_rows = true;
-
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -1456,7 +1453,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool allow_kv_rows = true) const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
