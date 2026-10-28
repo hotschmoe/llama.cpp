@@ -197,8 +197,8 @@ public:
     // TODO: allow slices with coupled sequences
     static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
 
-    // padded length of the cell list of each slice; 0 if the ubatch cannot split, a single slice attends to the whole cache
-    uint32_t get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv) const;
+    // padded length of the longest cell list of the slices; 0 if the ubatch cannot split
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;

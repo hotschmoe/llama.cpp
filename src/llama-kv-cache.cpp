@@ -1294,7 +1294,7 @@ uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     return 0;
 }
 
-uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv) const {
+uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch) const {
     if (n_stream != 1) {
         return 0;
     }
@@ -1308,11 +1308,6 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_k
     const auto & cells = v_cells[0];
 
     const uint32_t n_pad_cur = 256;
-
-    // a single slice attends to the whole cache (one sequence)
-    if (n_slices == 1) {
-        return std::min(n_kv, get_size());
-    }
 
     uint32_t n_max = 0;
 
@@ -2945,7 +2940,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv      = kv->get_n_kv(sinfos[i_cur]);
-    n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur], n_kv);
+    n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
 
     return true;
 }
