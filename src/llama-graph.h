@@ -1271,12 +1271,12 @@ struct llm_graph_context {
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
+            ggml_tensor * kv_rows, // [n_kv, n_stream], k and v are shared by the streams
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il,
-            ggml_tensor * kv_rows = nullptr) const; // [n_kv, n_stream], k and v are shared by the streams
+                    int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
