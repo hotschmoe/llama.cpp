@@ -11,6 +11,12 @@
 #include <set>
 #include <vector>
 
+#if defined(__GNUC__)
+#    define LLAMA_ATTRIBUTE_NOINLINE __attribute__((noinline))
+#else
+#    define LLAMA_ATTRIBUTE_NOINLINE
+#endif
+
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
     llama_pos x = 0;
@@ -379,6 +385,7 @@ public:
 
     // get the lists of cells of sequence seq_id
     // one list of max `n_per_seq` for each seq_id, padded with -1
+    LLAMA_ATTRIBUTE_NOINLINE
     void get_seq_cells(const std::vector<llama_seq_id> & seq_ids, int32_t * data, int64_t n_per_seq) const {
         assert(seq_ids.size() >= 1);
 
