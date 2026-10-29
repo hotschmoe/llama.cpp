@@ -338,6 +338,18 @@ public:
     const llama_cparams cparams;
 };
 
+// KQ mask and the optional per-sequence cell rows of a unified cache (see ggml_flash_attn_ext_rows)
+// the mask has two shapes depending on whether `rows` is used:
+//   rows != nullptr: [n_kv_rows, n_batch/n_slices, 1, n_slices]
+//   rows == nullptr: [n_kv,      n_batch/n_stream, 1, n_stream]
+// TODO: use this in place of all KQ masks (attn_no_cache, attn_k, attn_k_dsa, etc.) - follow-up PR
+struct llm_attn_mask {
+    ggml_tensor * mask     = nullptr;
+    ggml_tensor * mask_cnv = nullptr; // same shape
+    ggml_tensor * rows     = nullptr; // I32 [n_kv_rows, n_slices]
+    uint32_t      n_kv     = 0;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -357,19 +369,12 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kq_mask() const { return attn_mask.mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    // attention over the cells of each sequence, the mask columns follow these rows
-    ggml_tensor * self_kv_rows = nullptr; // I32 [n_kv_rows, n_slices]
-
-    // cells of the K/V views, the rows must stay inside them
-    uint32_t n_kv = 0;
+    llm_attn_mask attn_mask;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -528,25 +533,16 @@ public:
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
     ggml_tensor * get_v_idxs_swa() const { return self_v_idxs_swa; }
 
-    ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
-    ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
+    ggml_tensor * get_kq_mask()     const { return attn_mask.mask_cnv; }
+    ggml_tensor * get_kq_mask_swa() const { return attn_mask_swa.mask_cnv; }
 
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    // attention over the cells of each sequence, see llm_graph_input_attn_kv
-    ggml_tensor * self_kv_rows     = nullptr; // I32 [n_kv_rows, n_slices]
-    ggml_tensor * self_kv_rows_swa = nullptr; // I32 [n_kv_rows, n_slices]
-
-    uint32_t n_kv     = 0;
-    uint32_t n_kv_swa = 0;
+    llm_attn_mask attn_mask;
+    llm_attn_mask attn_mask_swa;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
