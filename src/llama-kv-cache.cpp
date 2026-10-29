@@ -1796,10 +1796,15 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const ggml_tensor * kv_rows) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    if (kv_rows) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(kv_rows->buffer));
+        GGML_ASSERT(kv_rows->ne[0] == n_kv && kv_rows->ne[1] == n_stream);
+    }
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
@@ -1829,11 +1834,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
         /*.rows             =*/ kv_rows ? (const int32_t *) kv_rows->data : nullptr,
     };
-
-    if (kv_rows) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(kv_rows->buffer));
-        GGML_ASSERT(kv_rows->ne[0] == n_kv && kv_rows->ne[1] == n_stream);
-    }
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
