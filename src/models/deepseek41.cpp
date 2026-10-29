@@ -642,7 +642,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
-        ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+        ggml_tensor * raw_mask = inp_attn->self_attn_mask.cnv;
 
         const int32_t topk_src = hparams.dsv41_topk_src[il];
         const int64_t k_sel    = top_k->ne[0];
@@ -781,7 +781,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
-    ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+    ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_attn_mask.raw);
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
