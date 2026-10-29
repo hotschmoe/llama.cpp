@@ -76,26 +76,27 @@ static bool can_reuse_attn_mask(
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
     const uint32_t n_kv_rows = get_n_kv_rows(mctx, cparams);
+    const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
+    const auto     n_tokens  = ubatch.n_tokens;
 
-    if (!attn_mask.rows) {
-        return n_kv_rows == 0 && can_reuse_kq_mask(attn_mask.mask, mctx, ubatch, cparams);
-    }
+    // the current ubatch uses rows only when rows are enabled and it can split into streams
+    const bool use_rows = n_kv_rows > 0 && n_slices > 0;
 
-    // a ubatch that cannot split uses the dense mask
-    const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
-    if (n_slices == 0) {
+    // the previous mask and the current ubatch must agree on the layout
+    if (use_rows != (attn_mask.rows != nullptr)) {
         return false;
     }
 
-    bool res = n_kv_rows > 0;
+    if (!use_rows) {
+        return can_reuse_kq_mask(attn_mask.mask, mctx, ubatch, cparams);
+    }
 
+    bool res = true;
     res &= attn_mask.n_kv == mctx->get_n_kv();
-
     res &= attn_mask.rows->ne[0] == n_kv_rows;
     res &= attn_mask.rows->ne[1] == n_slices;
-
     res &= attn_mask.mask->ne[0] == n_kv_rows;
-    res &= attn_mask.mask->ne[1] == ubatch.n_tokens/n_slices;
+    res &= attn_mask.mask->ne[1] == n_tokens/n_slices;
     res &= attn_mask.mask->ne[3] == n_slices;
 
     return res;
