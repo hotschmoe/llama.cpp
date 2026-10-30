@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1503,6 +1504,10 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
     common_prompt_checkpoint checkpoint;
     std::vector<bool> needs_anchor;
 
+    // -1: not known yet, 0: the masked-block pass leaves the recurrent memory as it was (no checkpoint needed),
+    //  1: the pass advances it, so the recurrent state is checkpointed and restored around every pass
+    int ckpt_mode = -1;
+
     // per-phase wall time of the draft pass (us): checkpoint save, masked-block decode, argmax, restore
     int64_t t_save_us = 0, t_decode_us = 0, t_argmax_us = 0, t_restore_us = 0;
     int32_t n_passes  = 0;
@@ -1527,6 +1532,10 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
         n_max = std::min(n_max, int32_t(std::min(llama_n_batch(ctx), llama_n_ubatch(ctx))) - 1);
         vocab = llama_model_get_vocab(llama_get_model(ctx));
         batch = common_batch(ctx);
+
+        if (const char * env = getenv("LLAMA_DRAFT_SELF_CKPT")) {
+            ckpt_mode = atoi(env) ? 1 : -1;
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens &) override { needs_anchor[seq_id] = true; }
@@ -1552,8 +1561,11 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
 
             // Restore recurrent state before removing the temporary attention KV suffix,
             // using the same checkpoint mechanism as the caller's verification rollback.
+            // Not needed when the non-causal pass only reads the recurrent state (see llm_arch_noncausal_keeps_rs).
             int64_t t0 = ggml_time_us();
-            checkpoint.update_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ckpt_mode != 0) {
+                checkpoint.update_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
             int64_t t1 = ggml_time_us();
             t_save_us += t1 - t0;
             batch.clear();
@@ -1578,7 +1590,13 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
             }
             t1 = ggml_time_us();
             t_argmax_us += t1 - t0;
-            if (!checkpoint.load_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            if (ckpt_mode < 0 && ret == 0) {
+                // the recurrent memory was left alone iff the sequence still ends right before the block
+                ckpt_mode = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) >= dp.pos0 ? 1 : 0;
+                SPC_TRC("draft-self: masked-block pass %s the recurrent state, %s\n",
+                        ckpt_mode ? "advances" : "keeps", ckpt_mode ? "checkpointing every pass" : "no checkpoint needed");
+            }
+            if ((ckpt_mode != 0 && !checkpoint.load_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) ||
                     !llama_memory_seq_rm(llama_get_memory(ctx), seq_id, dp.pos0, -1)) {
                 GGML_ABORT("failed to restore target state after self-drafting");
             }

@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1940,6 +1942,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+
+    // a non-causal pass of these models only reads the recurrent states: put the recurrent metadata (positions,
+    // pending rollback index) back afterwards, so the pass leaves no trace there and needs no state checkpoint
+    struct rs_meta_guard {
+        llama_memory_recurrent * mem = nullptr;
+        llama_memory_recurrent::meta saved;
+        ~rs_meta_guard() {
+            if (mem) {
+                mem->meta_restore(std::move(saved));
+            }
+        }
+    } rs_keep;
+    if (!cparams.causal_attn && llm_arch_noncausal_keeps_rs(model.arch)) {
+        auto * mem_hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        rs_keep.mem = mem_hyb ? mem_hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+        if (rs_keep.mem) {
+            rs_keep.saved = rs_keep.mem->meta_save();
+        }
+    }
 
     llama_memory_context_ptr mctx;
 
