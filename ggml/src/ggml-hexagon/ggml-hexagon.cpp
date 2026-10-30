@@ -2202,7 +2202,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     // Enable FastRPC QoS mode
     {
         struct remote_rpc_control_latency l;
-        l.enable = 1;
+        l.enable  = 1;
+        l.latency = 0; // was left uninitialized; 0 = no latency target (ignored by the driver)
 
         int err = remote_handle64_control(this->handle, DSPRPC_CONTROL_LATENCY, (void *) &l, sizeof(l));
         if (err != 0) {
