@@ -119,10 +119,24 @@ static inline void init_indices_ramp(int32_t * indices_buf, uint32_t count, uint
     }
 }
 
+// "X sorts after Y" in the ascending network. stable: composite key (value, then LOWER index is greater) so that a
+// descending sort yields value desc / index asc, same as a stable sort. Indices must be unique per row.
 __attribute__((always_inline))
-static inline void vec_cas(HVX_Vector * X_val, HVX_Vector * X_idx, HVX_Vector * Y_val, HVX_Vector * Y_idx, bool asc) {
-    HVX_VectorPred pred = asc ? Q6_Q_vcmp_gt_VsfVsf(*X_val, *Y_val)
-                              : Q6_Q_vcmp_gt_VsfVsf(*Y_val, *X_val);
+static inline HVX_VectorPred key_gt(HVX_Vector xv, HVX_Vector xi, HVX_Vector yv, HVX_Vector yi, bool stable) {
+    HVX_VectorPred gt = Q6_Q_vcmp_gt_VsfVsf(xv, yv);
+    if (!stable) {
+        return gt;
+    }
+    HVX_VectorPred lt  = Q6_Q_vcmp_gt_VsfVsf(yv, xv);
+    HVX_VectorPred eq  = Q6_Q_not_Q(Q6_Q_or_QQ(gt, lt));
+    HVX_VectorPred ilt = Q6_Q_vcmp_gt_VwVw(yi, xi);
+    return Q6_Q_or_QQ(gt, Q6_Q_and_QQ(eq, ilt));
+}
+
+__attribute__((always_inline))
+static inline void vec_cas(HVX_Vector * X_val, HVX_Vector * X_idx, HVX_Vector * Y_val, HVX_Vector * Y_idx, bool asc, bool stable) {
+    HVX_VectorPred pred = asc ? key_gt(*X_val, *X_idx, *Y_val, *Y_idx, stable)
+                              : key_gt(*Y_val, *Y_idx, *X_val, *X_idx, stable);
     HVX_Vector next_X_val = Q6_V_vmux_QVV(pred, *Y_val, *X_val);
     HVX_Vector next_Y_val = Q6_V_vmux_QVV(pred, *X_val, *Y_val);
     HVX_Vector next_X_idx = Q6_V_vmux_QVV(pred, *Y_idx, *X_idx);
@@ -134,7 +148,7 @@ static inline void vec_cas(HVX_Vector * X_val, HVX_Vector * X_idx, HVX_Vector * 
 }
 
 __attribute__((always_inline))
-static inline void bitonic_cas_32(HVX_Vector * V, HVX_Vector * I, int d, HVX_VectorPred dir_mask, HVX_Vector idx_vec, HVX_Vector zero_vec) {
+static inline void bitonic_cas_32(HVX_Vector * V, HVX_Vector * I, int d, HVX_VectorPred dir_mask, HVX_Vector idx_vec, HVX_Vector zero_vec, bool stable) {
     HVX_VectorPred mask_left;
     HVX_Vector V_rot_left, V_rot_right;
     HVX_Vector I_rot_left, I_rot_right;
@@ -174,13 +188,19 @@ static inline void bitonic_cas_32(HVX_Vector * V, HVX_Vector * I, int d, HVX_Vec
     HVX_Vector V_paired = Q6_V_vmux_QVV(mask_left, V_rot_left, V_rot_right);
     HVX_Vector I_paired = Q6_V_vmux_QVV(mask_left, I_rot_left, I_rot_right);
 
-    HVX_VectorPred V_gt_Vpaired = Q6_Q_vcmp_gt_VsfVsf(*V, V_paired);
-    HVX_VectorPred Vpaired_gt_V = Q6_Q_vcmp_gt_VsfVsf(V_paired, *V);
     HVX_VectorPred mask_right = Q6_Q_not_Q(mask_left);
-    HVX_VectorPred Q_asc = Q6_Q_or_QQ(
-        Q6_Q_and_QQ(mask_left, V_gt_Vpaired),
-        Q6_Q_and_QQ(Vpaired_gt_V, mask_right)
-    );
+    HVX_VectorPred Q_asc;
+    if (stable) {
+        // keys are unique: right lanes want "paired > self" == not "self > paired"
+        Q_asc = Q6_Q_xor_QQ(key_gt(*V, *I, V_paired, I_paired, true), mask_right);
+    } else {
+        HVX_VectorPred V_gt_Vpaired = Q6_Q_vcmp_gt_VsfVsf(*V, V_paired);
+        HVX_VectorPred Vpaired_gt_V = Q6_Q_vcmp_gt_VsfVsf(V_paired, *V);
+        Q_asc = Q6_Q_or_QQ(
+            Q6_Q_and_QQ(mask_left, V_gt_Vpaired),
+            Q6_Q_and_QQ(Vpaired_gt_V, mask_right)
+        );
+    }
     HVX_VectorPred Q_swap = Q6_Q_or_QQ(
         Q6_Q_and_QQ(dir_mask, Q_asc),
         Q6_Q_and_QQ(Q6_Q_not_Q(dir_mask), Q6_Q_not_Q(Q_asc))
@@ -191,7 +211,7 @@ static inline void bitonic_cas_32(HVX_Vector * V, HVX_Vector * I, int d, HVX_Vec
 }
 
 __attribute__((always_inline))
-static inline void bitonic_sort_generic_hvx(uint8_t * values, uint8_t * indices, int K, bool asc_order) {
+static inline void bitonic_sort_generic_hvx(uint8_t * values, uint8_t * indices, int K, bool asc_order, bool stable) {
     HVX_Vector V[32];
     HVX_Vector I[32];
 
@@ -218,20 +238,20 @@ static inline void bitonic_sort_generic_hvx(uint8_t * values, uint8_t * indices,
                     if ((v1 & v_dist) == 0) {
                         int v2 = v1 + v_dist;
                         bool asc = (s < M) ? ((((v1 * 32) >> s) % 2) == 0) : asc_order;
-                        vec_cas(&V[v1], &I[v1], &V[v2], &I[v2], asc);
+                        vec_cas(&V[v1], &I[v1], &V[v2], &I[v2], asc, stable);
                     }
                 }
             } else {
                 if (s < 5) {
                     HVX_VectorPred dir_mask = Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(idx_vec, Q6_V_vsplat_R(1 << s)), zero_vec);
                     for (int v = 0; v < K; v++) {
-                        bitonic_cas_32(&V[v], &I[v], d, dir_mask, idx_vec, zero_vec);
+                        bitonic_cas_32(&V[v], &I[v], d, dir_mask, idx_vec, zero_vec, stable);
                     }
                 } else {
                     for (int v = 0; v < K; v++) {
                         bool asc = (s < M) ? ((((v * 32) >> s) % 2) == 0) : asc_order;
                         HVX_VectorPred dir_mask = asc ? pred_all_1s : pred_all_0s;
-                        bitonic_cas_32(&V[v], &I[v], d, dir_mask, idx_vec, zero_vec);
+                        bitonic_cas_32(&V[v], &I[v], d, dir_mask, idx_vec, zero_vec, stable);
                     }
                 }
             }
@@ -244,7 +264,7 @@ static inline void bitonic_sort_generic_hvx(uint8_t * values, uint8_t * indices,
     }
 }
 
-static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t n_vec, bool init_indices) {
+static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t n_vec, bool init_indices, bool stable) {
     HVX_Vector zero_vec = Q6_V_vzero();
     HVX_Vector idx_vec = *(const HVX_Vector *) argsort_ramp_lut;
 
@@ -276,7 +296,7 @@ static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t
                         HVX_Vector Vv2 = *(HVX_Vector *)(values + v2 * 128);
                         HVX_Vector Iv2 = *(HVX_Vector *)(indices + v2 * 128);
 
-                        vec_cas(&Vv1, &Iv1, &Vv2, &Iv2, asc);
+                        vec_cas(&Vv1, &Iv1, &Vv2, &Iv2, asc, stable);
 
                         *(HVX_Vector *)(values + v1 * 128)  = Vv1;
                         *(HVX_Vector *)(indices + v1 * 128) = Iv1;
@@ -291,7 +311,7 @@ static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t
                         HVX_Vector Vv = *(HVX_Vector *)(values + v * 128);
                         HVX_Vector Iv = *(HVX_Vector *)(indices + v * 128);
 
-                        bitonic_cas_32(&Vv, &Iv, d, dir_mask, idx_vec, zero_vec);
+                        bitonic_cas_32(&Vv, &Iv, d, dir_mask, idx_vec, zero_vec, stable);
 
                         *(HVX_Vector *)(values + v * 128)  = Vv;
                         *(HVX_Vector *)(indices + v * 128) = Iv;
@@ -304,7 +324,7 @@ static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t
                         HVX_Vector Vv = *(HVX_Vector *)(values + v * 128);
                         HVX_Vector Iv = *(HVX_Vector *)(indices + v * 128);
 
-                        bitonic_cas_32(&Vv, &Iv, d, dir_mask, idx_vec, zero_vec);
+                        bitonic_cas_32(&Vv, &Iv, d, dir_mask, idx_vec, zero_vec, stable);
 
                         *(HVX_Vector *)(values + v * 128)  = Vv;
                         *(HVX_Vector *)(indices + v * 128) = Iv;
@@ -340,7 +360,7 @@ static void top_k_select_tiled(dma_queue * dma_q, struct htp_thread_trace * tr,
             hvx_splat_f32_u((uint8_t *) (values_buf + tile_count), -INFINITY, tile_elems - tile_count);
         }
 
-        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, tile_elems / 32, true);
+        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, tile_elems / 32, true, false);
         uint32_t tile_k = MIN(k, tile_count);
         for (uint32_t j = 0; j < tile_k; j++) {
             candidate_values[candidate_pos] = values_buf[j];
@@ -358,7 +378,7 @@ static void top_k_select_tiled(dma_queue * dma_q, struct htp_thread_trace * tr,
         }
     }
 
-    bitonic_sort_vtcm_desc((uint8_t *) candidate_values, (uint8_t *) candidate_indices, merge_n_vec_pow2, false);
+    bitonic_sort_vtcm_desc((uint8_t *) candidate_values, (uint8_t *) candidate_indices, merge_n_vec_pow2, false, false);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, 0);
 
     for (uint32_t j = 0; j < k; j++) {
@@ -368,33 +388,33 @@ static void top_k_select_tiled(dma_queue * dma_q, struct htp_thread_trace * tr,
 }
 
 __attribute__((always_inline))
-static inline void sort32_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 1, order == GGML_SORT_ORDER_ASC);
+static inline void sort32_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 1, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 __attribute__((always_inline))
-static inline void sort64_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 2, order == GGML_SORT_ORDER_ASC);
+static inline void sort64_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 2, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 __attribute__((always_inline))
-static inline void sort128_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 4, order == GGML_SORT_ORDER_ASC);
+static inline void sort128_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 4, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 __attribute__((always_inline))
-static inline void sort256_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 8, order == GGML_SORT_ORDER_ASC);
+static inline void sort256_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 8, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 __attribute__((always_inline))
-static inline void sort512_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 16, order == GGML_SORT_ORDER_ASC);
+static inline void sort512_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 16, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 __attribute__((always_inline))
-static inline void sort1024_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order) {
-    bitonic_sort_generic_hvx(values, indices, 32, order == GGML_SORT_ORDER_ASC);
+static inline void sort1024_f32_hvx(uint8_t * values, uint8_t * indices, enum ggml_sort_order order, bool stable) {
+    bitonic_sort_generic_hvx(values, indices, 32, order == GGML_SORT_ORDER_ASC, stable);
 }
 
 static void merge_runs(
@@ -523,7 +543,7 @@ static void htp_sort_chunk_job(unsigned int n, unsigned int i, void * data) {
             hvx_splat_f32_u((uint8_t *)(values_buf + real_count), -INFINITY, chunk_elems - real_count);
         }
 
-        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, chunk_elems / 32, true);
+        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, chunk_elems / 32, true, false);
 
         for (uint32_t j = 0; j < local_k; j++) {
             merge_values[i * local_k + j]  = values_buf[j];
@@ -662,39 +682,39 @@ static inline size_t coord_offset(struct htp_tensor_row_coord c, size_t nb1, siz
     return (size_t) c.i01 * nb1 + (size_t) c.i02 * nb2 + (size_t) c.i03 * nb3;
 }
 
+#define TOP_K_POW2_SWITCH(STABLE)                                                                                  switch (ne00) {                                                                                                   case 32:   sort32_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;           case 64:   sort64_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;           case 128:  sort128_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;          case 256:  sort256_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;          case 512:  sort512_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;          case 1024: sort1024_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC, STABLE); break;     }
+
 static inline void compute_row_sort(
     float * cur_values,
     int32_t * cur_indices,
     uint32_t ne00,
     uint32_t chunk_elems,
     bool is_top_k,
+    bool stable,
     enum ggml_sort_order order
 ) {
     if (is_top_k) {
         if (ne00 == 32 || ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512 || ne00 == 1024) {
-            switch (ne00) {
-                case 32:   sort32_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
-                case 64:   sort64_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
-                case 128:  sort128_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
-                case 256:  sort256_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
-                case 512:  sort512_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
-                case 1024: sort1024_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, GGML_SORT_ORDER_DESC); break;
+            if (stable) {
+                TOP_K_POW2_SWITCH(true)
+            } else {
+                TOP_K_POW2_SWITCH(false)
             }
         } else {
             if (chunk_elems > ne00) {
                 hvx_splat_f32_u((uint8_t *)(cur_values + ne00), -INFINITY, chunk_elems - ne00);
             }
-            bitonic_sort_vtcm_desc((uint8_t *) cur_values, (uint8_t *) cur_indices, chunk_elems / 32, true);
+            bitonic_sort_vtcm_desc((uint8_t *) cur_values, (uint8_t *) cur_indices, chunk_elems / 32, true, stable);
         }
     } else {
         if (ne00 == 32 || ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512 || ne00 == 1024) {
             switch (ne00) {
-                case 32:   sort32_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
-                case 64:   sort64_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
-                case 128:  sort128_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
-                case 256:  sort256_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
-                case 512:  sort512_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
-                case 1024: sort1024_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order); break;
+                case 32:   sort32_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
+                case 64:   sort64_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
+                case 128:  sort128_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
+                case 256:  sort256_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
+                case 512:  sort512_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
+                case 1024: sort1024_f32_hvx((uint8_t *) cur_values, (uint8_t *) cur_indices, order, false); break;
             }
         } else {
             init_indices_ramp(cur_indices, ne00, 0);
@@ -745,6 +765,7 @@ static void htp_sort_multi_row_job(unsigned int n, unsigned int ith, void * data
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     bool is_top_k = kparams->is_top_k != 0;
+    const bool stable = kparams->stable != 0;
     uint32_t k = dst->ne[0];
     enum ggml_sort_order order = (enum ggml_sort_order) kparams->order;
 
@@ -788,7 +809,7 @@ static void htp_sort_multi_row_job(unsigned int n, unsigned int ith, void * data
             dma_queue_pop(dma_q);
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);
-            compute_row_sort(cur_values, cur_indices, ne00, chunk_elems, is_top_k, order);
+            compute_row_sort(cur_values, cur_indices, ne00, chunk_elems, is_top_k, stable, order);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);
 
             // Push writeback of current slot
@@ -817,7 +838,7 @@ static void htp_sort_multi_row_job(unsigned int n, unsigned int ith, void * data
             dma_sync_read(dma_q, values_buf, src_addr, src_bytes);
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);
-            compute_row_sort(values_buf, indices_buf, ne00, chunk_elems, is_top_k, order);
+            compute_row_sort(values_buf, indices_buf, ne00, chunk_elems, is_top_k, stable, order);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);
 
             dma_sync_write(dma_q, dst_addr, indices_buf, dst_bytes);
@@ -931,7 +952,7 @@ static int op_sort_common(struct htp_ops_context * octx, bool is_top_k) {
 
             struct htp_thread_trace * tr = &octx->ctx->trace[0];
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, 0);
-            bitonic_sort_vtcm_desc((uint8_t *) cand_vals, (uint8_t *) cand_idxs, merge_elems / 32, false);
+            bitonic_sort_vtcm_desc((uint8_t *) cand_vals, (uint8_t *) cand_idxs, merge_elems / 32, false, false);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, 0);
             dma_sync_write(octx->ctx->dma[0], dst->data, cand_idxs, k * sizeof(int32_t));
         } else {

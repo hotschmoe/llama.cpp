@@ -18,6 +18,7 @@ struct htp_sort_kernel_params {
     uint32_t vtcm_size;
     uint32_t merge_elems;
     uint32_t n_slots;
+    uint32_t stable;            // TOP_K only: ties -> lower index first (single chunk rows only)
     struct fastdiv_values div_ne01;
     struct fastdiv_values div_ne01_ne02;
 };

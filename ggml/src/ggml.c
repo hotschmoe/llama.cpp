@@ -5523,6 +5523,19 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// ggml_top_k_stable
+
+struct ggml_tensor * ggml_top_k_stable(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k) {
+    struct ggml_tensor * result = ggml_top_k(ctx, a, k);
+
+    ggml_set_op_params_i32(result, 0, 1);
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(

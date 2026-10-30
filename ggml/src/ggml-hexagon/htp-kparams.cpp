@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #ifndef M_LOG2E
@@ -2242,6 +2243,17 @@ static bool htp_kparams_solve_sort(
         return false;
     }
 
+    // stable top-k (ggml_top_k_stable): only the single-chunk register/VTCM bitonic paths implement the index tie-break
+    bool stable = is_top_k && ((const int32_t *) op->op_params)[0] != 0;
+    if (stable && (layout.n_chunks != 1 || ne00 > 1024)) {
+        return false;
+    }
+    // test-only negative control: run the unstable kernel but keep the op accepted
+    static const bool spoil = getenv("GGML_HEXAGON_TOPK_SPOIL") != nullptr;
+    if (spoil) {
+        stable = false;
+    }
+
     kparams->n_threads     = layout.n_threads;
     kparams->order         = (uint32_t) order;
     kparams->is_top_k      = is_top_k ? 1 : 0;
@@ -2250,6 +2262,7 @@ static bool htp_kparams_solve_sort(
     kparams->vtcm_size     = (uint32_t) layout.total_bytes;
     kparams->merge_elems   = layout.merge_elems;
     kparams->n_slots       = layout.n_slots;
+    kparams->stable        = stable ? 1 : 0;
     kparams->div_ne01      = init_fastdiv_values((uint32_t) src0->ne[1]);
     kparams->div_ne01_ne02 = init_fastdiv_values((uint32_t) (src0->ne[1] * src0->ne[2]));
 
