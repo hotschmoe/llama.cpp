@@ -3074,6 +3074,27 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+// cpy = CPY(VIEW(gdn tail: K snapshot slots), recurrent cache view), as built by llm_build_delta_net_base::build_recurrent_attn
+static bool ggml_cpu_gdn_snap_cpy_ok(const struct ggml_tensor * gdn, const struct ggml_tensor * cpy) {
+    const int32_t K = ggml_get_op_params_i32(gdn, 0);
+    if (K <= 1 || cpy->op != GGML_OP_CPY || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const struct ggml_tensor * v   = gdn->src[2];
+    const struct ggml_tensor * src = cpy->src[0];
+    const struct ggml_tensor * dst = cpy->src[1];
+    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const int64_t D = S_v * S_v * H;
+    const int64_t n_written = n_tokens < K ? n_tokens : K;
+    if (gdn->src[0]->type != GGML_TYPE_F32 || src->op != GGML_OP_VIEW || src->view_src != gdn ||
+        src->view_offs != (size_t) (S_v * H * n_tokens * n_seqs) * sizeof(float) || !ggml_is_contiguous(src) ||
+        src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    return src->ne[0] == D && src->ne[1] == n_seqs && src->ne[2] == n_written && src->ne[3] == 1 &&
+           dst->ne[0] == D && dst->ne[1] == n_seqs && dst->ne[2] == n_written && dst->ne[3] == 1;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3085,6 +3106,19 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_GATED_DELTA_NET) {
+        // GDN with K > 1 recurrent snapshots + the CPY of the snapshot tail into the recurrent cache: write the snapshots
+        // straight into the cache (saves writing, re-reading and copying K states per GDN layer)
+        int j = node_n + 1;
+        while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && ggml_cpu_gdn_snap_cpy_ok(node, cgraph->nodes[j])) {
+            ggml_compute_forward_gated_delta_net_snap(params, node, cgraph->nodes[j]->src[1]);
+            return j - node_n;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

@@ -11111,6 +11111,7 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
+    const ggml_tensor * snap_dst,   // K > 1 only: write snapshot slots here ([D, n_seqs, n_written] view) instead of into dst
     int64_t ir0,
     int64_t ir1) {
 
@@ -11252,8 +11253,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
+                    float * curr_state_o = snap_dst
+                        ? (float *) ((char *) snap_dst->data + target_slot * snap_dst->nb[2] + iv3 * snap_dst->nb[1]) + iv1 * S_v * S_v
+                        : state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
                 }
             }
@@ -11264,7 +11266,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
 static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const ggml_tensor * snap_dst) {
 
     ggml_tensor * V = dst->src[2];
     int64_t nr = V->ne[1] * V->ne[3];
@@ -11298,7 +11301,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir0 = dr * current_chunk;
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, snap_dst, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
@@ -11311,13 +11314,23 @@ void ggml_compute_forward_gated_delta_net(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_gated_delta_net_f32(params, dst);
+                ggml_compute_forward_gated_delta_net_f32(params, dst, nullptr);
             } break;
         default:
             {
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+// GDN (K > 1) fused with the CPY of its snapshot tail into the recurrent cache: the K snapshot slots are written
+// straight into snap_dst (the CPY destination), the snapshot part of dst is left unwritten and the CPY is skipped
+void ggml_compute_forward_gated_delta_net_snap(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        const ggml_tensor * snap_dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_gated_delta_net_f32(params, dst, snap_dst);
 }
 
 
