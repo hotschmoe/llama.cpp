@@ -1708,6 +1708,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    // OPPOLL spins on a non-blocking read for at most spin_limit_us per response, then falls back to blocking reads.
+    // The watchdog aborts with a diagnostic if the DSP never answers.
+    static const int64_t spin_limit_us = (int64_t) (getenv("GGML_HEXAGON_OPPOLL_SPIN_MS") ? atof(getenv("GGML_HEXAGON_OPPOLL_SPIN_MS")) * 1000.0 : 400000.0);
+    static const int64_t watchdog_us   = (int64_t) (getenv("GGML_HEXAGON_RSP_TIMEOUT_S") ? atof(getenv("GGML_HEXAGON_RSP_TIMEOUT_S")) * 1e6 : 120e6);
+    int64_t wait_t0 = ggml_time_us();
+    bool    spin_off = false;
+
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1717,12 +1724,22 @@ void ggml_hexagon_session::flush_pending(bool all) {
         uint32_t               n_dbufs;
 
         // Read response packet from queue
-        const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
+        const uint32_t timeo = (opt_oppoll && !spin_off) ? 0 : DSPQUEUE_TIMEOUT;
 
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+            const int64_t waited = ggml_time_us() - wait_t0;
+            if (opt_oppoll && !spin_off && waited > spin_limit_us) {
+                spin_off = true;
+            }
+            if (waited > watchdog_us) {
+                GGML_ABORT("ggml-hex: %s no DSP response for %.1f s (req seq %llu rsp seq %llu)\n", this->c_name(), waited / 1e6,
+                           (unsigned long long) this->batch_req_seq.load(), (unsigned long long) this->batch_rsp_seq.load());
+            }
             continue;
         }
+        spin_off = false;
+        wait_t0  = ggml_time_us();
 
         if (err != 0) {
             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
