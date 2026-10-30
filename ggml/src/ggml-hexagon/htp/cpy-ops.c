@@ -240,6 +240,77 @@ DEFINE_CPY_CONVERT_SAMESHAPE(f16_f32, hvx_copy_f16_f32_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(f32_f16, hvx_copy_f32_f16_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(i32_f32, hvx_copy_i32_f32_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(f32_i32, hvx_copy_f32_i32_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(bf16_f32, hvx_copy_bf16_f32_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(bf16_f32_trunc, hvx_copy_bf16_f32_trunc_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(f32_bf16, hvx_copy_f32_bf16_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(round_f32, hvx_round_bf16_f32_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(round_f32_trunc, hvx_round_bf16_f32_trunc_aa)
+
+// Flat convert of an element range [elem_start, elem_start + nelem) of two dense tensors, one DMA block of
+// blk_elems at a time (double buffered). CONV_FUNC converts one block of n elements between aligned VTCM buffers.
+#define DEFINE_CPY_CONVERT_FLAT(NAME, CONV_FUNC)                                                       \
+static void cpy_thread_##NAME##_flat(unsigned int nth, unsigned int ith, void * data) {                \
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;                                   \
+    struct htp_ops_context * octx = ct->octx;                                                          \
+    const struct htp_tensor *src0 = octx->src[0];                                                      \
+    const struct htp_tensor *dst  = octx->dst;                                                         \
+                                                                                                       \
+    const uint32_t blk_elems = ct->kparams->u.flat.blk_elems;                                          \
+    const uint32_t th_start  = ct->elem_start + ith * ct->elem_per_thread;                             \
+    const uint32_t th_end    = MIN(th_start + ct->elem_per_thread, ct->elem_start + ct->nelem);        \
+    if (th_start >= th_end) return;                                                                    \
+                                                                                                       \
+    dma_queue * dma_q = octx->ctx->dma[ith];                                                           \
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                             \
+                                                                                                       \
+    const struct htp_copy_convert_vtcm_layout * L = &ct->layout;                                       \
+    const uint32_t src0_buf_size = L->src0_buf_size;                                                   \
+    const uint32_t dst_buf_size  = L->dst_buf_size;                                                    \
+    uint8_t * vtcm_src0_base = ct->vtcm_src0 + ith * L->spad0_size_per_thread;                         \
+    uint8_t * vtcm_dst_base  = ct->vtcm_dst  + ith * L->spad1_size_per_thread;                         \
+    const uint32_t ss = ct->kparams->src0_type_size;                                                   \
+    const uint32_t ds = ct->kparams->dst_type_size;                                                    \
+                                                                                                       \
+    uint32_t f = th_start;   /* next element to fetch */                                               \
+    uint32_t c = th_start;   /* next element to convert */                                             \
+                                                                                                       \
+    for (uint32_t b = 0; b < 2 && f < th_end; ++b) {                                                   \
+        uint8_t * src_spad = vtcm_src0_base + b * src0_buf_size;                                       \
+        uint8_t * dst_spad = vtcm_dst_base  + b * dst_buf_size;                                        \
+        const uint32_t n = MIN(blk_elems, th_end - f);                                                 \
+        dma_queue_push(dma_q, dma_make_data(dst->data, dst_spad), ds, dst_buf_size, ds, 0);            \
+        dma_queue_push(dma_q, dma_make_data(src_spad, src0->data + (uint64_t) f * ss), n * ss, n * ss, n * ss, 1); \
+        f += n;                                                                                        \
+    }                                                                                                  \
+                                                                                                       \
+    for (uint32_t blk = 0; c < th_end; ++blk) {                                                        \
+        const uint32_t n = MIN(blk_elems, th_end - c);                                                 \
+        uint8_t * dst_spad = (uint8_t *) (uintptr_t) dma_queue_pop(dma_q).src;                         \
+        uint8_t * src_spad = (uint8_t *) (uintptr_t) dma_queue_pop(dma_q).dst;                         \
+                                                                                                       \
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) blk);                             \
+        CONV_FUNC(dst_spad, src_spad, n);                                                              \
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) blk);                              \
+                                                                                                       \
+        dma_queue_push(dma_q, dma_make_data(dst->data + (uint64_t) c * ds, dst_spad), n * ds, n * ds, n * ds, 1); \
+        c += n;                                                                                        \
+                                                                                                       \
+        if (f < th_end) {                                                                              \
+            const uint32_t fn = MIN(blk_elems, th_end - f);                                            \
+            dma_queue_push(dma_q, dma_make_data(src_spad, src0->data + (uint64_t) f * ss), fn * ss, fn * ss, fn * ss, 1); \
+            f += fn;                                                                                   \
+        }                                                                                              \
+    }                                                                                                  \
+    dma_queue_flush(dma_q);                                                                            \
+}
+
+DEFINE_CPY_CONVERT_FLAT(bf16_f32, hvx_copy_bf16_f32_aa)
+DEFINE_CPY_CONVERT_FLAT(bf16_f32_trunc, hvx_copy_bf16_f32_trunc_aa)
+DEFINE_CPY_CONVERT_FLAT(f32_bf16, hvx_copy_f32_bf16_aa)
+DEFINE_CPY_CONVERT_FLAT(round_f32, hvx_round_bf16_f32_aa)
+DEFINE_CPY_CONVERT_FLAT(round_f32_trunc, hvx_round_bf16_f32_trunc_aa)
+DEFINE_CPY_CONVERT_FLAT(f16_f32, hvx_copy_f16_f32_aa)
+DEFINE_CPY_CONVERT_FLAT(f32_f16, hvx_copy_f32_f16_aa)
 
 static int cpy_scalar(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
@@ -380,7 +451,14 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
     ct.vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, ct.layout.off_dst);
 
     work_queue_func_t copy_fun = NULL;
-    if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32) {
+    const bool bf16_trunc = (kparams->flags & HTP_COPY_FLAG_BF16_TRUNC) != 0;
+    if ((kparams->flags & HTP_COPY_FLAG_BF16_ROUND) && src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32) {
+        copy_fun = bf16_trunc ? cpy_thread_round_f32_trunc_sameshape : cpy_thread_round_f32_sameshape;
+    } else if (dst->type == HTP_TYPE_BF16 && src0->type == HTP_TYPE_F32) {
+        copy_fun = bf16_trunc ? cpy_thread_bf16_f32_trunc_sameshape : cpy_thread_bf16_f32_sameshape;
+    } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_BF16) {
+        copy_fun = cpy_thread_f32_bf16_sameshape;
+    } else if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32) {
         copy_fun = cpy_thread_f16_f32_sameshape;
     } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16) {
         copy_fun = cpy_thread_f32_f16_sameshape;
@@ -388,6 +466,68 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
         copy_fun = cpy_thread_i32_f32_sameshape;
     } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_I32) {
         copy_fun = cpy_thread_f32_i32_sameshape;
+    } else {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+    return HTP_STATUS_OK;
+}
+
+static int cpy_contig_convert(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    uint32_t elem_start = 0;
+    uint32_t nelem      = kparams->total_elems;
+
+    if (octx->ctx->mdev.count > 1) {
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+            kparams->total_elems, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        elem_start = range.start;
+        nelem      = range.count;
+    }
+
+    if (nelem == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    if (kparams->vtcm_size > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    const uint32_t n_threads = octx->n_threads;
+
+    struct htp_copy_context ct;
+    // one "row" of blk_elems elements per block
+    htp_copy_convert_vtcm_layout_build(&ct.layout, kparams->u.flat.blk_elems, kparams->src0_type_size, kparams->dst_type_size, 1, n_threads);
+
+    ct.octx            = octx;
+    ct.kparams         = kparams;
+    ct.elem_start      = elem_start;
+    ct.nelem           = nelem;
+    ct.elem_per_thread = kparams->u.flat.elems_per_thread;
+
+    uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+    ct.vtcm_src0 = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, ct.layout.off_src0);
+    ct.vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, ct.layout.off_dst);
+
+    const bool trunc = (kparams->flags & HTP_COPY_FLAG_BF16_TRUNC) != 0;
+    work_queue_func_t copy_fun = NULL;
+    if ((kparams->flags & HTP_COPY_FLAG_BF16_ROUND) && src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32) {
+        copy_fun = trunc ? cpy_thread_round_f32_trunc_flat : cpy_thread_round_f32_flat;
+    } else if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_BF16) {
+        copy_fun = trunc ? cpy_thread_bf16_f32_trunc_flat : cpy_thread_bf16_f32_flat;
+    } else if (src0->type == HTP_TYPE_BF16 && dst->type == HTP_TYPE_F32) {
+        copy_fun = cpy_thread_f32_bf16_flat;
+    } else if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {
+        copy_fun = cpy_thread_f16_f32_flat;
+    } else if (src0->type == HTP_TYPE_F16 && dst->type == HTP_TYPE_F32) {
+        copy_fun = cpy_thread_f32_f16_flat;
     } else {
         return HTP_STATUS_NO_SUPPORT;
     }
@@ -430,7 +570,8 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
     work_queue_func_t copy_fun = NULL;
     switch (src0->type) {
         case HTP_TYPE_F32: copy_fun = cpy_thread_f32_reshape; break;
-        case HTP_TYPE_F16: copy_fun = cpy_thread_f16_reshape; break;
+        case HTP_TYPE_F16:
+        case HTP_TYPE_BF16: copy_fun = cpy_thread_f16_reshape; break; // 2-byte elements
         case HTP_TYPE_I32: copy_fun = cpy_thread_i32_reshape; break;
         default: return HTP_STATUS_NO_SUPPORT;
     }
@@ -455,6 +596,9 @@ int op_cpy(struct htp_ops_context * octx) {
             break;
         case HTP_COPY_KERNEL_SAMESHAPE_CONVERT:
             status = cpy_sameshape_convert(octx, kparams);
+            break;
+        case HTP_COPY_KERNEL_CONTIG_CONVERT:
+            status = cpy_contig_convert(octx, kparams);
             break;
         case HTP_COPY_KERNEL_RESHAPE:
             status = cpy_reshape(octx, kparams);

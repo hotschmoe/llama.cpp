@@ -15,7 +15,12 @@ enum htp_copy_kernel_type {
     HTP_COPY_KERNEL_RESHAPE            = 4,
     HTP_COPY_KERNEL_SCALAR             = 5,
     HTP_COPY_KERNEL_GATHER_ROWS        = 6,
+    HTP_COPY_KERNEL_CONTIG_CONVERT     = 7,   // both sides dense: flat element-range convert (f32<->bf16 and rounding)
 };
+
+// kparams->flags
+#define HTP_COPY_FLAG_BF16_ROUND  (1u << 0)  // f32 -> f32 rounded to bf16 precision (fused f32->bf16->f32 pair)
+#define HTP_COPY_FLAG_BF16_TRUNC  (1u << 1)  // NEGATIVE CONTROL ONLY: truncate instead of round-to-nearest-even
 
 struct htp_copy_convert_params {
     uint32_t              blk_rows;         // rows moved per DMA descriptor
@@ -32,11 +37,18 @@ struct htp_copy_reshape_params {
     struct fastdiv_values div_ne02_ne01_ne00;
 };
 
+struct htp_copy_flat_params {
+    uint32_t blk_elems;        // elements per DMA block (multiple of 64)
+    uint32_t elems_per_thread; // multiple of 64 (except it may exceed what is left for the last thread)
+};
+
 struct htp_copy_kernel_params {
     uint8_t  kernel_type;
     uint8_t  src0_type_size;
     uint8_t  dst_type_size;
     uint8_t  n_threads;
+    uint8_t  flags;
+    uint8_t  pad[3];
 
     uint32_t total_elems;
     uint32_t total_rows;
@@ -46,6 +58,7 @@ struct htp_copy_kernel_params {
         struct htp_copy_convert_params convert;
         struct htp_copy_reshape_params reshape;
         struct htp_gather_rows_params  gather;
+        struct htp_copy_flat_params    flat;
     } u;
 };
 

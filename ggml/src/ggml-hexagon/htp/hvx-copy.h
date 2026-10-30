@@ -329,4 +329,130 @@ static inline void hvx_copy_f32_i32_uu(uint8_t * restrict dst, const uint8_t * r
     hvx_copy_f32_i32_loop_body(HVX_UVector, HVX_UVector, hvx_vec_store_u);
 }
 
+//// fp32 <-> bf16 (bit-exact with ggml_compute_fp32_to_bf16 / ggml_compute_bf16_to_fp32)
+
+// Round each fp32 lane to bf16 precision, round-to-nearest-even, NaN forced quiet; the result keeps the
+// bf16 value in the upper 16 bits of the lane and zero in the lower 16 (i.e. it is the rounded fp32 value).
+// trunc != 0 is the env-gated negative control (truncation instead of RNE); it must never be on by default.
+static inline HVX_Vector hvx_vec_round_bf16_f32(HVX_Vector v, bool trunc) {
+    const HVX_Vector hi_mask = Q6_V_vsplat_R(0xffff0000u);
+    const HVX_Vector c_nan   = Q6_V_vsplat_R(0x7f800000u);
+    const HVX_Vector c_qnan  = Q6_V_vsplat_R(0x00400000u);
+
+    HVX_Vector r;
+    if (trunc) {
+        r = Q6_V_vand_VV(v, hi_mask);
+    } else {
+        const HVX_Vector one   = Q6_V_vsplat_R(1u);
+        const HVX_Vector c7fff = Q6_V_vsplat_R(0x7fffu);
+        HVX_Vector lsb  = Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(v, 16), one);
+        HVX_Vector bias = Q6_Vw_vadd_VwVw(lsb, c7fff);
+        r = Q6_V_vand_VV(Q6_Vw_vadd_VwVw(v, bias), hi_mask);
+    }
+
+    // NaN: keep the upper half of the payload and set the quiet bit (bf16 (u >> 16) | 64)
+    HVX_Vector absv = Q6_V_vand_VV(v, Q6_V_vsplat_R(0x7fffffffu));
+    HVX_VectorPred is_nan = Q6_Q_vcmp_gt_VuwVuw(absv, c_nan);
+    HVX_Vector nanv = Q6_V_vor_VV(Q6_V_vand_VV(v, hi_mask), c_qnan);
+    return Q6_V_vmux_QVV(is_nan, nanv, r);
+}
+
+// pack two fp32 vectors (already rounded, bf16 in the upper halves) into one vector of 64 bf16
+static inline HVX_Vector hvx_vec_pack_bf16(HVX_Vector r0, HVX_Vector r1) {
+    return Q6_Vh_vpacko_VwVw(r1, r0);
+}
+
+// widen the first 32 bf16 lanes (lo) / last 32 bf16 lanes (hi) of v to fp32 (exact)
+static inline HVX_VectorPair hvx_vec_bf16_to_f32(HVX_Vector v) {
+    HVX_VectorPair p = Q6_Ww_vunpack_Vh(v);
+    return Q6_W_vcombine_VV(Q6_Vw_vasl_VwR(Q6_V_hi_W(p), 16), Q6_Vw_vasl_VwR(Q6_V_lo_W(p), 16));
+}
+
+// n fp32 -> n bf16, destination and source are aligned. The source buffer must be readable up to a whole
+// number of 2 vectors (VTCM rows are 256-byte multiples) ; only n elements are written.
+static inline void hvx_copy_bf16_f32_aa_x(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n, bool trunc) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    HVX_Vector * restrict       vdst = (HVX_Vector *) dst;
+    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
+
+    const uint32_t nvec = n / 64;
+    const uint32_t nloe = n % 64;
+
+    uint32_t i = 0;
+    for (; i < nvec; i++) {
+        vdst[i] = hvx_vec_pack_bf16(hvx_vec_round_bf16_f32(vsrc[i * 2 + 0], trunc),
+                                    hvx_vec_round_bf16_f32(vsrc[i * 2 + 1], trunc));
+    }
+    if (nloe) {
+        HVX_Vector v = hvx_vec_pack_bf16(hvx_vec_round_bf16_f32(vsrc[i * 2 + 0], trunc),
+                                         hvx_vec_round_bf16_f32(vsrc[i * 2 + 1], trunc));
+        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(uint16_t), v);
+    }
+}
+
+static inline void hvx_copy_bf16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_copy_bf16_f32_aa_x(dst, src, n, false);
+}
+static inline void hvx_copy_bf16_f32_trunc_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_copy_bf16_f32_aa_x(dst, src, n, true);
+}
+
+// n bf16 -> n fp32, destination and source are aligned
+static inline void hvx_copy_f32_bf16_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    HVX_Vector * restrict       vdst = (HVX_Vector *) dst;
+    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
+
+    const uint32_t nvec = n / 64;
+    uint32_t       nloe = n % 64;
+
+    uint32_t i = 0;
+    for (; i < nvec; i++) {
+        HVX_VectorPair p = hvx_vec_bf16_to_f32(vsrc[i]);
+        vdst[i * 2 + 0] = Q6_V_lo_W(p);
+        vdst[i * 2 + 1] = Q6_V_hi_W(p);
+    }
+    if (nloe) {
+        HVX_VectorPair p = hvx_vec_bf16_to_f32(vsrc[i]);
+        i *= 2;
+        if (nloe >= 32) {
+            vdst[i++] = Q6_V_lo_W(p);
+            nloe -= 32;
+            if (nloe) {
+                hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), Q6_V_hi_W(p));
+            }
+        } else {
+            hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), Q6_V_lo_W(p));
+        }
+    }
+}
+
+// n fp32 -> n fp32 rounded to bf16 precision (== f32->bf16->f32), destination and source are aligned
+static inline void hvx_round_bf16_f32_aa_x(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n, bool trunc) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    HVX_Vector * restrict       vdst = (HVX_Vector *) dst;
+    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
+
+    const uint32_t nvec = n / 32;
+    const uint32_t nloe = n % 32;
+
+    uint32_t i = 0;
+    for (; i < nvec; i++) {
+        vdst[i] = hvx_vec_round_bf16_f32(vsrc[i], trunc);
+    }
+    if (nloe) {
+        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), hvx_vec_round_bf16_f32(vsrc[i], trunc));
+    }
+}
+
+static inline void hvx_round_bf16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_round_bf16_f32_aa_x(dst, src, n, false);
+}
+static inline void hvx_round_bf16_f32_trunc_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_round_bf16_f32_aa_x(dst, src, n, true);
+}
+
 #endif // HVX_COPY_H

@@ -82,6 +82,14 @@ bool htp_kparams_solve_allreduce(
     struct htp_allreduce_kernel_params * kparams
 );
 
+bool htp_kparams_solve_cpy_ex(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
+    bool round_bf16,
+    struct htp_copy_kernel_params * kparams
+);
+
 bool htp_kparams_solve_rms_norm_mul(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,

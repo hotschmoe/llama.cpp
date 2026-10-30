@@ -2479,25 +2479,69 @@ static bool htp_kparams_solve_concat(
     return false;
 }
 
-static bool htp_kparams_solve_cpy(
+// NEGATIVE CONTROL ONLY: GGML_HEXAGON_BF16_SPOIL=1 makes the f32 -> bf16 kernels truncate instead of round-to-nearest-even.
+static bool htp_cpy_bf16_spoil() {
+    static const bool v = [] { const char * e = getenv("GGML_HEXAGON_BF16_SPOIL"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+static bool htp_cpy_is_bf16_pair(enum ggml_type a, enum ggml_type b) {
+    return (a == GGML_TYPE_F32 && b == GGML_TYPE_BF16) || (a == GGML_TYPE_BF16 && b == GGML_TYPE_F32);
+}
+
+// Flat (dense -> dense) element-range conversion: threads take 64-element aligned ranges, each streamed in blocks.
+static bool htp_cpy_solve_flat(struct htp_copy_kernel_params * kparams, uint32_t nelem, uint32_t n_threads_max, size_t vtcm_size) {
+    const uint32_t nth_max = n_threads_max > 0 ? n_threads_max : 4;
+    const uint32_t min_per_thread = 2048;
+
+    uint32_t nth = (nelem + min_per_thread - 1) / min_per_thread;
+    nth = nth < 1 ? 1 : (nth > nth_max ? nth_max : nth);
+
+    uint32_t per_thread = (nelem + nth - 1) / nth;
+    per_thread = (per_thread + 63) & ~63u;
+    uint32_t blk = per_thread < 4096 ? per_thread : 4096;
+    if (blk == 0) blk = 64;
+
+    struct htp_copy_convert_vtcm_layout layout;
+    htp_copy_convert_vtcm_layout_build(&layout, blk, kparams->src0_type_size, kparams->dst_type_size, 1, nth);
+    if (vtcm_size > 0 && layout.total_bytes > vtcm_size) {
+        return false;
+    }
+
+    kparams->kernel_type             = HTP_COPY_KERNEL_CONTIG_CONVERT;
+    kparams->n_threads               = (uint8_t) nth;
+    kparams->vtcm_size               = (uint32_t) layout.total_bytes;
+    kparams->u.flat.blk_elems        = blk;
+    kparams->u.flat.elems_per_thread = per_thread;
+    return true;
+}
+
+// round_bf16: f32 -> f32 rounded to bf16 precision (the fused f32->bf16->f32 pair)
+bool htp_kparams_solve_cpy_ex(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * op,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
+    bool round_bf16,
     struct htp_copy_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
     kparams->kernel_type = HTP_COPY_KERNEL_UNSUPPORTED;
 
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * dst  = op;
-
     if (!src0 || !dst) {
         return false;
     }
 
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_I32) {
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_I32 && src0->type != GGML_TYPE_BF16) {
         return false;
     }
-    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_I32) {
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_I32 && dst->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if ((src0->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_BF16) &&
+        !(src0->type == dst->type || htp_cpy_is_bf16_pair(src0->type, dst->type))) {
+        return false;
+    }
+    if (round_bf16 && !(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32)) {
         return false;
     }
 
@@ -2514,16 +2558,30 @@ static bool htp_kparams_solve_cpy(
     kparams->dst_type_size  = (uint8_t) dst_type_size;
     kparams->total_elems    = (uint32_t) nelem_src;
 
+    const bool to_bf16 = dst->type == GGML_TYPE_BF16 || round_bf16;
+    if (round_bf16) {
+        kparams->flags |= HTP_COPY_FLAG_BF16_ROUND;
+    }
+    if (to_bf16 && htp_cpy_bf16_spoil()) {
+        kparams->flags |= HTP_COPY_FLAG_BF16_TRUNC;
+    }
+
     if (nelem_src == 0) {
         kparams->kernel_type = HTP_COPY_KERNEL_1D_CONTIG;
         return true;
     }
 
-    if (nelem_src == 1) {
-        if (src0->type == dst->type) {
-            kparams->kernel_type = HTP_COPY_KERNEL_SCALAR;
-            return true;
-        }
+    const uint32_t n_threads  = htp_session_n_threads(sess);
+    const uint32_t mdev_count = htp_session_mdev_count(sess);
+    const size_t   vtcm_size  = htp_session_vtcm_size(sess);
+
+    const bool sametype = (src0->type == dst->type) && !round_bf16;
+
+    if (nelem_src == 1 && sametype) {
+        kparams->kernel_type = HTP_COPY_KERNEL_SCALAR;
+        return true;
+    }
+    if (nelem_src == 1 && !round_bf16 && !htp_cpy_is_bf16_pair(src0->type, dst->type)) {
         if ((src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32) ||
             (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) ||
             (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
@@ -2534,7 +2592,6 @@ static bool htp_kparams_solve_cpy(
         return false;
     }
 
-    const bool sametype = (src0->type == dst->type);
     const bool same_extents = ggml_are_same_shape(src0, dst);
 
     const bool transposed = (src0->nb[0] > src0->nb[1])    || (dst->nb[0] > dst->nb[1]) ||
@@ -2544,10 +2601,6 @@ static bool htp_kparams_solve_cpy(
 
     const bool src_is_contiguous = ggml_is_contiguous(src0);
     const bool dst_is_contiguous = ggml_is_contiguous(dst);
-
-    const uint32_t n_threads  = htp_session_n_threads(sess);
-    const uint32_t mdev_count = htp_session_mdev_count(sess);
-    const size_t   vtcm_size  = htp_session_vtcm_size(sess);
 
     if (sametype) {
         if (src_is_contiguous && dst_is_contiguous) {
@@ -2593,6 +2646,11 @@ static bool htp_kparams_solve_cpy(
         return true;
     }
 
+    // f32 <-> bf16 (and the fused bf16 rounding) when both sides are dense: one flat pass, any shape
+    if ((htp_cpy_is_bf16_pair(src0->type, dst->type) || round_bf16) && src_is_contiguous && dst_is_contiguous) {
+        return htp_cpy_solve_flat(kparams, (uint32_t) nelem_src, n_threads, vtcm_size);
+    }
+
     if (!sameshape) {
         return false;
     }
@@ -2600,7 +2658,8 @@ static bool htp_kparams_solve_cpy(
     const bool valid_conversion = (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
                                   (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) ||
                                   (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32) ||
-                                  (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+                                  (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) ||
+                                  htp_cpy_is_bf16_pair(src0->type, dst->type) || round_bf16;
     if (!valid_conversion) {
         return false;
     }
@@ -2622,6 +2681,14 @@ static bool htp_kparams_solve_cpy(
     kparams->u.convert.div_ne02_ne01 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1]));
 
     return true;
+}
+
+static bool htp_kparams_solve_cpy(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_copy_kernel_params * kparams
+) {
+    return htp_kparams_solve_cpy_ex(sess, op->src[0], op, false, kparams);
 }
 
 static bool im2col_3d_calc_output_size(

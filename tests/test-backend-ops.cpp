@@ -1314,6 +1314,7 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual bool allow_nan() { return false; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1544,7 +1545,7 @@ struct test_case {
 
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
-                if (std::isnan(f1[i]) || std::isnan(f2[i])) {
+                if (!ud->tc->allow_nan() && (std::isnan(f1[i]) || std::isnan(f2[i]))) {
                     printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
                     ud->ok = false;
                     return true;
@@ -3410,6 +3411,125 @@ struct test_cpy : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check if casting between f32 and i32 is consistent
             init_tensor_uniform(t, -150.f, 150.f);
+        }
+    }
+};
+
+// Clover's build_bf16_round: CPY f32 -> bf16, bf16 -> f32, or the pair cast(cast(x, BF16), F32) (which a backend may fuse
+// into a single f32 -> f32 rounding pass). Compared BIT-EXACTLY (error = number of differing elements, tolerance 0) on
+// adversarial bit patterns: round-to-nearest-even ties, NaN/Inf/denormals/overflow-by-rounding, signed zeros.
+struct test_cpy_bf16 : public test_case {
+    enum mode_t { F32_TO_BF16, BF16_TO_F32, PAIR };
+
+    const mode_t mode;
+    const std::array<int64_t, 4> ne;       // logical shape seen by the cpy
+    const std::array<int64_t, 4> permute;  // {0,0,0,0} = none
+    const int64_t pad;                     // > 0: src is a view of rows padded by this many elements (non-contiguous rows)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return mode == PAIR ? "CPY_BF16_ROUND" : "CPY";
+    }
+
+    bool run_whole_graph() override { return mode == PAIR; }
+    bool allow_nan() override { return true; }
+
+    std::string vars() override {
+        const char * m = mode == F32_TO_BF16 ? "f32_bf16" : mode == BF16_TO_F32 ? "bf16_f32" : "pair";
+        return std::string("mode=") + m + "," + VARS_TO_STR3(ne, permute, pad);
+    }
+
+    size_t op_size(ggml_tensor * t) override {
+        return ggml_nbytes(t) + ggml_nbytes(t->src[0]);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    // bit-exact: number of elements whose float bit patterns differ
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t x, y;
+            memcpy(&x, a + i, 4);
+            memcpy(&y, b + i, 4);
+            bad += x != y;
+        }
+        return (double) bad;
+    }
+
+    test_cpy_bf16(mode_t mode, std::array<int64_t, 4> ne, std::array<int64_t, 4> permute = {0, 0, 0, 0}, int64_t pad = 0)
+        : mode(mode), ne(ne), permute(permute), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type_src = mode == BF16_TO_F32 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        ggml_tensor * src;
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_4d(ctx, type_src, ne[0] + pad, ne[1], ne[2], ne[3]);
+            ggml_set_name(buf, "src_buf");
+            src = ggml_view_4d(ctx, buf, ne[0], ne[1], ne[2], ne[3], buf->nb[1], buf->nb[2], buf->nb[3], 0);
+        } else {
+            src = ggml_new_tensor(ctx, type_src, 4, ne.data());
+        }
+        ggml_set_name(src, "src");
+        if (permute[0] + permute[1] + permute[2] + permute[3] > 0) {
+            src = ggml_permute(ctx, src, permute[0], permute[1], permute[2], permute[3]);
+            ggml_set_name(src, "src_permuted");
+        }
+
+        ggml_tensor * out;
+        if (mode == F32_TO_BF16) {
+            out = ggml_cast(ctx, src, GGML_TYPE_BF16);
+        } else if (mode == BF16_TO_F32) {
+            out = ggml_cast(ctx, src, GGML_TYPE_F32);
+        } else {
+            out = ggml_cast(ctx, ggml_cast(ctx, src, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src || t->buffer == nullptr) {
+                continue;
+            }
+            const size_t nel = ggml_nbytes(t) / ggml_type_size(t->type);
+            if (t->type == GGML_TYPE_F32) {
+                static const uint32_t special[] = {
+                    0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7f800001, 0xff8fffff,
+                    0x7fffffff, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff, 0x00800000, 0x7f7fffff, 0xff7fffff,
+                    0x7f7f8000, 0x7f7f7fff, 0x7f7f8001, 0xff7f8000, 0x3f808000, 0x3f818000, 0x3f800000, 0x3f7fffff,
+                };
+                std::vector<uint32_t> d(nel);
+                for (size_t i = 0; i < nel; i++) {
+                    const uint32_t r = rng();
+                    const uint32_t kind = (r >> 28) % 10;
+                    uint32_t v = (uint32_t) rng();
+                    if (kind < 3) {
+                        // any bit pattern (random exponent; some NaN/Inf)
+                    } else if (kind < 6) {
+                        v = (v & 0xffff0000u) | 0x8000u;                 // exact tie, odd/even bf16 mantissa lsb
+                    } else if (kind == 6) {
+                        v = (v & 0xffff0000u) | (0x7fffu + (rng() & 3)); // just below / above / at a tie
+                    } else if (kind == 7) {
+                        float f = ((float) (rng() % 200001) - 100000.0f) / 25000.0f; // activation-like [-4, 4]
+                        memcpy(&v, &f, 4);
+                    } else {
+                        v = special[rng() % (sizeof(special) / sizeof(special[0]))];
+                    }
+                    d[i] = v;
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, nel * 4);
+            } else if (t->type == GGML_TYPE_BF16) {
+                std::vector<uint16_t> d(nel);
+                for (size_t i = 0; i < nel; i++) {
+                    d[i] = (uint16_t) rng();
+                    if ((i % 61) == 7) d[i] = (uint16_t) (0x7f80 + (rng() & 0xff)); // inf / NaN payloads
+                    if ((i % 67) == 9) d[i] = (uint16_t) (rng() & 0x807f);          // denormals / zeros
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, nel * 2);
+            }
         }
     }
 };
@@ -10012,6 +10132,45 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// Cases shaped like Clover's build_bf16_round / BF16 casts (decode = width 1, draft = width 16, verify/prefill = 256 tokens)
+static void add_test_cases_clover(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf = false) {
+    // exact shapes of the model graphs (hidden 2048, GDN qkv 8192, state 128x128x32, ...)
+    const std::vector<std::array<int64_t, 4>> model_shapes = {
+        {2048, 1, 1, 1},    {2048, 16, 1, 1},   {2048, 256, 1, 1},
+        {4096, 1, 1, 1},    {4096, 256, 1, 1},  {8192, 1, 1, 1},   {8192, 256, 1, 1},
+        {128, 32, 1, 1},    {128, 32, 256, 1},  {128, 16, 256, 1}, {1, 32, 256, 1},
+        {256, 2, 1, 1},     {256, 16, 1, 1},    {256, 2, 256, 1},  {256, 16, 256, 1},
+    };
+    for (const auto & ne : model_shapes) {
+        for (auto mode : {test_cpy_bf16::F32_TO_BF16, test_cpy_bf16::BF16_TO_F32, test_cpy_bf16::PAIR}) {
+            test_cases.emplace_back(new test_cpy_bf16(mode, ne));
+        }
+    }
+    if (perf) {
+        return;
+    }
+    // odd lengths / widths: ne0 not a multiple of 32/64, tiny, multi-thread sizes not a multiple of the block
+    const std::vector<std::array<int64_t, 4>> edge_shapes = {
+        {1, 1, 1, 1},  {3, 1, 1, 1},   {31, 1, 1, 1},  {32, 1, 1, 1},   {33, 1, 1, 1},   {63, 1, 1, 1},   {64, 1, 1, 1},
+        {65, 1, 1, 1}, {127, 3, 1, 1}, {100, 7, 5, 1}, {2049, 1, 1, 1}, {4097, 2, 1, 1}, {70001, 1, 1, 1},
+        {5000, 3, 2, 2}, {1000003, 1, 1, 1},
+    };
+    for (const auto & ne : edge_shapes) {
+        for (auto mode : {test_cpy_bf16::F32_TO_BF16, test_cpy_bf16::BF16_TO_F32, test_cpy_bf16::PAIR}) {
+            test_cases.emplace_back(new test_cpy_bf16(mode, ne));
+        }
+    }
+    // non-contiguous sources: rows padded (view), permuted (dim 1 <-> 2: rows stay dense), full transpose (gather)
+    for (auto mode : {test_cpy_bf16::F32_TO_BF16, test_cpy_bf16::BF16_TO_F32, test_cpy_bf16::PAIR}) {
+        test_cases.emplace_back(new test_cpy_bf16(mode, {128, 32, 16, 1}, {0, 0, 0, 0}, 32));
+        test_cases.emplace_back(new test_cpy_bf16(mode, {100, 5, 3, 2}, {0, 0, 0, 0}, 7));
+        test_cases.emplace_back(new test_cpy_bf16(mode, {128, 16, 32, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_cpy_bf16(mode, {33, 5, 7, 2}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_cpy_bf16(mode, {128, 32, 1, 1}, {1, 0, 2, 3}));
+        test_cases.emplace_back(new test_cpy_bf16(mode, {45, 17, 3, 1}, {1, 0, 2, 3}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -12551,6 +12710,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    add_test_cases_clover(test_cases);
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13100,6 +13260,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    add_test_cases_clover(test_cases, true);
     return test_cases;
 }
 

@@ -397,6 +397,32 @@ static bool fuse_repeat_get_rows(const ggml_hexagon_session * sess, htp_opnode &
     return true;
 }
 
+// CPY(F32 -> BF16) + CPY(BF16 -> F32) (Clover build_bf16_round) -> one F32 -> F32 pass that rounds to bf16 precision.
+// Bit-identical to the unfused pair (same RNE arithmetic); the BF16 intermediate is never materialized.
+static bool fuse_cpy_bf16_round(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_CPY || cur.opcode != HTP_OP_CPY) return false;
+    if (prev.fused.size() != 0 || prev.outputs.size() != 1 || prev.inputs.size() != 2 || cur.inputs.size() != 2) return false;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
+
+    const ggml_tensor * src = prev.src0();
+    const ggml_tensor * mid = prev.dst();
+    const ggml_tensor * dst = cur.dst();
+
+    if (src->type != GGML_TYPE_F32 || mid->type != GGML_TYPE_BF16 || dst->type != GGML_TYPE_F32) return false;
+    if (cur.src0()->type != GGML_TYPE_BF16 || !ggml_are_same_shape(src, dst)) return false;
+    if ((mid->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
+    if (htp_inputs_overlap_unsafe(prev, dst)) return false;
+
+    struct htp_copy_kernel_params kparams;
+    if (!htp_kparams_solve_cpy_ex(sess, src, dst, /*round_bf16=*/ true, &kparams)) return false;
+
+    prev.inputs[1]  = cur.inputs[1];
+    prev.outputs[0] = dst;
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_unary_mul_glu(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     htp_op_code glu_op = HTP_OP_INVALID;
     switch (prev.opcode) {
@@ -608,6 +634,7 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
              op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
              op == GGML_OP_SSM_CONV ||
+             (op == GGML_OP_CPY && graph->nodes[i]->type == GGML_TYPE_BF16) ||
              (op == GGML_OP_MUL_MAT && !htp_is_hadamard(graph->nodes[i]))) &&
             ggml_node_has_n_uses(graph, i, 1)) {
             extra->flags |= HTP_TENSOR_FUSEABLE;
@@ -638,7 +665,8 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
         case HTP_OP_GET_ROWS:
             return htp_fusion_enabled(HTP_FUSE_REPEAT_GET_ROWS) && fuse_repeat_get_rows(sess, prev, cur);
         case HTP_OP_CPY:
-            return htp_fusion_enabled(HTP_FUSE_GDN_CPY) && fuse_gdn_cpy(sess, prev, cur);
+            return (htp_fusion_enabled(HTP_FUSE_GDN_CPY)        && fuse_gdn_cpy(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_CPY_BF16_ROUND) && fuse_cpy_bf16_round(sess, prev, cur));
         case HTP_OP_MUL_MAT:
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX) && fuse_mul_mat_nx(sess, prev, cur);
         case HTP_OP_MUL_MAT_ID:
