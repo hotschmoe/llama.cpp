@@ -15,10 +15,11 @@
 #define HTP_TENSOR_TILE_N_ROWS      32
 
 #define HTP_TENSOR_TILE_SIZE_F16    2048
-#define HTP_TENSOR_TILE_SIZE_Q4_0   576
+// Q4_0 / IQ4_NL tiles are padded from 576 to 640 B in DDR so one tile row is a single contiguous DMA
+#define HTP_TENSOR_TILE_SIZE_Q4_0   640
 #define HTP_TENSOR_TILE_SIZE_Q4_1   640
 #define HTP_TENSOR_TILE_SIZE_Q8_0   1088
-#define HTP_TENSOR_TILE_SIZE_IQ4_NL 576
+#define HTP_TENSOR_TILE_SIZE_IQ4_NL 640
 #define HTP_TENSOR_TILE_SIZE_MXFP4  544
 #define HTP_TENSOR_TILE_SIZE_Q4_K   640
 #define HTP_TENSOR_TILE_SIZE_Q5_K   768
