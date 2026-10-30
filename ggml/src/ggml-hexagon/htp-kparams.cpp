@@ -2494,12 +2494,16 @@ static bool htp_cpy_solve_flat(struct htp_copy_kernel_params * kparams, uint32_t
     const uint32_t nth_max = n_threads_max > 0 ? n_threads_max : 4;
     const uint32_t min_per_thread = 2048;
 
+    // bisection caps (diagnostics only)
+    static const uint32_t cap_nth = getenv("GGML_HEXAGON_BF16_NTH") ? (uint32_t) atoi(getenv("GGML_HEXAGON_BF16_NTH")) : 0;
+    static const uint32_t cap_blk = getenv("GGML_HEXAGON_BF16_BLK") ? (uint32_t) atoi(getenv("GGML_HEXAGON_BF16_BLK")) : 4096;
     uint32_t nth = (nelem + min_per_thread - 1) / min_per_thread;
     nth = nth < 1 ? 1 : (nth > nth_max ? nth_max : nth);
+    if (cap_nth > 0 && nth > cap_nth) nth = cap_nth;
 
     uint32_t per_thread = (nelem + nth - 1) / nth;
     per_thread = (per_thread + 63) & ~63u;
-    uint32_t blk = per_thread < 4096 ? per_thread : 4096;
+    uint32_t blk = per_thread < cap_blk ? per_thread : cap_blk;
     if (blk == 0) blk = 64;
 
     struct htp_copy_convert_vtcm_layout layout;
@@ -2558,9 +2562,37 @@ bool htp_kparams_solve_cpy_ex(
     kparams->dst_type_size  = (uint8_t) dst_type_size;
     kparams->total_elems    = (uint32_t) nelem_src;
 
+    const bool is_bf16_cpy = round_bf16 || src0->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_BF16;
+    if (is_bf16_cpy) {
+        // bisection switches (diagnostics only): claim bf16 casts only inside [MIN, MAX] elements
+        static const long min_el = getenv("GGML_HEXAGON_BF16_MIN_ELEMS") ? atol(getenv("GGML_HEXAGON_BF16_MIN_ELEMS")) : 0;
+        static const long max_el = getenv("GGML_HEXAGON_BF16_MAX_ELEMS") ? atol(getenv("GGML_HEXAGON_BF16_MAX_ELEMS")) : 0;
+        if (nelem_src < min_el || (max_el > 0 && nelem_src > max_el)) {
+            return false;
+        }
+        // comma separated substrings of the source tensor name
+        static const char * name_in = getenv("GGML_HEXAGON_BF16_NAME");
+        if (name_in) {
+            bool hit = false;
+            std::string list(name_in), item;
+            for (size_t i = 0; i <= list.size(); i++) {
+                if (i == list.size() || list[i] == ',') {
+                    if (!item.empty() && strstr(src0->name, item.c_str())) hit = true;
+                    item.clear();
+                } else {
+                    item += list[i];
+                }
+            }
+            if (!hit) return false;
+        }
+    }
+
     const bool to_bf16 = dst->type == GGML_TYPE_BF16 || round_bf16;
     if (round_bf16) {
         kparams->flags |= HTP_COPY_FLAG_BF16_ROUND;
+    }
+    if (is_bf16_cpy && getenv("GGML_HEXAGON_BF16_PREFLUSH")) {
+        kparams->flags |= HTP_COPY_FLAG_PREFLUSH;
     }
     if (to_bf16 && htp_cpy_bf16_spoil()) {
         kparams->flags |= HTP_COPY_FLAG_BF16_TRUNC;
@@ -2647,7 +2679,8 @@ bool htp_kparams_solve_cpy_ex(
     }
 
     // f32 <-> bf16 (and the fused bf16 rounding) when both sides are dense: one flat pass, any shape
-    if ((htp_cpy_is_bf16_pair(src0->type, dst->type) || round_bf16) && src_is_contiguous && dst_is_contiguous) {
+    static const bool no_flat = getenv("GGML_HEXAGON_BF16_NOFLAT") != nullptr; // A/B switch: row-wise path instead of flat
+    if (!no_flat && (htp_cpy_is_bf16_pair(src0->type, dst->type) || round_bf16) && src_is_contiguous && dst_is_contiguous) {
         return htp_cpy_solve_flat(kparams, (uint32_t) nelem_src, n_threads, vtcm_size);
     }
 

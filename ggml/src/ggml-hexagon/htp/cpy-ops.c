@@ -470,6 +470,9 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    if (kparams->flags & HTP_COPY_FLAG_PREFLUSH) {
+        hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
+    }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
     return HTP_STATUS_OK;
 }
@@ -532,6 +535,9 @@ static int cpy_contig_convert(struct htp_ops_context * octx, const struct htp_co
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    if (kparams->flags & HTP_COPY_FLAG_PREFLUSH) {
+        hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
+    }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
     return HTP_STATUS_OK;
 }
@@ -576,6 +582,9 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
         default: return HTP_STATUS_NO_SUPPORT;
     }
 
+    if (kparams->flags & HTP_COPY_FLAG_PREFLUSH) {
+        hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
+    }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
     return HTP_STATUS_OK;
 }

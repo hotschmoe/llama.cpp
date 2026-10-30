@@ -3534,6 +3534,63 @@ struct test_cpy_bf16 : public test_case {
     }
 };
 
+// Clover state-recall pattern in one graph: BF16 operand produced by a CPY in the same batch, then consumed by MUL_MAT
+// (scores = mul_mat(cast(k, BF16), q), remembered = mul_mat(cast(round(s), BF16), q)); LEAF is the control with a host-set BF16 operand.
+struct test_cpy_bf16_mm : public test_case {
+    enum mode_t { LEAF, CAST_SRC0, ROUND_CAST_SRC0, ROUND_SRC1 };
+
+    const mode_t mode;
+    const int64_t dk, dv, nv, width;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BF16_MM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        const char * m = mode == LEAF ? "leaf" : mode == CAST_SRC0 ? "cast" : mode == ROUND_CAST_SRC0 ? "roundcast" : "round1";
+        return std::string("mm=") + m + "," + VARS_TO_STR4(dk, dv, nv, width);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_cpy_bf16_mm(mode_t mode, int64_t dk, int64_t dv, int64_t nv, int64_t width)
+        : mode(mode), dk(dk), dv(dv), nv(nv), width(width) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dk, width, nv, 1);
+        ggml_set_name(q, "q");
+        if (mode == LEAF) {
+            ggml_tensor * s = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, dk, dv, nv, 1);
+            ggml_set_name(s, "s_bf16");
+            return ggml_mul_mat(ctx, s, q);
+        }
+        if (mode == ROUND_SRC1) {
+            ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, dk, dv, nv, 1);
+            ggml_set_name(w, "w_bf16");
+            ggml_tensor * qr = ggml_cast(ctx, ggml_cast(ctx, q, GGML_TYPE_BF16), GGML_TYPE_F32);
+            return ggml_mul_mat(ctx, w, qr);
+        }
+        ggml_tensor * s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dk, dv, nv, 1);
+        ggml_set_name(s, "s");
+        if (mode == ROUND_CAST_SRC0) {
+            s = ggml_cast(ctx, ggml_cast(ctx, s, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
+        return ggml_mul_mat(ctx, ggml_cast(ctx, s, GGML_TYPE_BF16), q);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src || t->buffer == nullptr) {
+                continue;
+            }
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
@@ -10155,6 +10212,12 @@ static void add_test_cases_clover(std::vector<std::unique_ptr<test_case>> & test
         {65, 1, 1, 1}, {127, 3, 1, 1}, {100, 7, 5, 1}, {2049, 1, 1, 1}, {4097, 2, 1, 1}, {70001, 1, 1, 1},
         {5000, 3, 2, 2}, {1000003, 1, 1, 1},
     };
+    // BF16 operand produced by a CPY in the same graph, consumed by MUL_MAT (state recall / local mix)
+    for (auto mode : {test_cpy_bf16_mm::LEAF, test_cpy_bf16_mm::CAST_SRC0, test_cpy_bf16_mm::ROUND_CAST_SRC0, test_cpy_bf16_mm::ROUND_SRC1}) {
+        for (int64_t width : {1, 13, 16, 256}) {
+            test_cases.emplace_back(new test_cpy_bf16_mm(mode, 128, 128, 32, width));
+        }
+    }
     for (const auto & ne : edge_shapes) {
         for (auto mode : {test_cpy_bf16::F32_TO_BF16, test_cpy_bf16::BF16_TO_F32, test_cpy_bf16::PAIR}) {
             test_cases.emplace_back(new test_cpy_bf16(mode, ne));

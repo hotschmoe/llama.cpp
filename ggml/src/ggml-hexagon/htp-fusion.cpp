@@ -411,7 +411,7 @@ static bool fuse_cpy_bf16_round(const ggml_hexagon_session * sess, htp_opnode & 
     if (src->type != GGML_TYPE_F32 || mid->type != GGML_TYPE_BF16 || dst->type != GGML_TYPE_F32) return false;
     if (cur.src0()->type != GGML_TYPE_BF16 || !ggml_are_same_shape(src, dst)) return false;
     if ((mid->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
-    if (htp_inputs_overlap_unsafe(prev, dst)) return false;
+    if (htp_inplace_overlap_unsafe(dst, src)) return false;
 
     struct htp_copy_kernel_params kparams;
     if (!htp_kparams_solve_cpy_ex(sess, src, dst, /*round_bf16=*/ true, &kparams)) return false;
@@ -634,9 +634,14 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
              op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
              op == GGML_OP_SSM_CONV ||
-             (op == GGML_OP_CPY && graph->nodes[i]->type == GGML_TYPE_BF16) ||
              (op == GGML_OP_MUL_MAT && !htp_is_hadamard(graph->nodes[i]))) &&
             ggml_node_has_n_uses(graph, i, 1)) {
+            extra->flags |= HTP_TENSOR_FUSEABLE;
+        }
+
+        // ggml_cast result: src[1] is the node itself, so one reader means two uses
+        if (op == GGML_OP_CPY && graph->nodes[i]->type == GGML_TYPE_BF16 && graph->nodes[i]->src[1] == graph->nodes[i] &&
+            ggml_node_has_n_uses(graph, i, 2)) {
             extra->flags |= HTP_TENSOR_FUSEABLE;
         }
     }
