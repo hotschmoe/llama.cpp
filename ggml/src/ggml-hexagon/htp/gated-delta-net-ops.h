@@ -20,6 +20,7 @@
 enum htp_gdn_kernel_type {
     HTP_GDN_KERNEL_HVX_RECURRENT = 0,
     HTP_GDN_KERNEL_HMX_CHUNKED   = 1,
+    HTP_GDN_KERNEL_HVX_RECURRENT_SNAP = 2, // HVX prompt kernel, snapshots written by async DMA from a third state buffer
 };
 
 struct htp_gdn_kernel_params {

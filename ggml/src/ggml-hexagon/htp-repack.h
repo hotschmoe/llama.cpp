@@ -45,6 +45,12 @@ static inline size_t htp_tiled_row_size(enum ggml_type type, int64_t ne0) {
     if (type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) {
         return (size_t) ne0 * sizeof(ggml_fp16_t);
     }
+    if (type == GGML_TYPE_Q4_0) {
+        return (size_t) (ne0 / 32) * (HTP_TENSOR_TILE_SIZE_Q4_0 / 32);
+    }
+    if (type == GGML_TYPE_IQ4_NL) {
+        return (size_t) (ne0 / 32) * (HTP_TENSOR_TILE_SIZE_IQ4_NL / 32);
+    }
     if (type == GGML_TYPE_Q6_K) {
         return (size_t) (ne0 / 32) * (HTP_TENSOR_TILE_SIZE_Q6_K / 32);
     }

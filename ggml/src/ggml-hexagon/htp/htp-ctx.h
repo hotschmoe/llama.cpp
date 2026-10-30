@@ -110,6 +110,7 @@ struct htp_context {
 
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+    uint32_t               dirty_hi;  // 1 + highest dirty_ranges slot used since the last reset
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;

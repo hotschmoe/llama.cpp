@@ -892,6 +892,156 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     dma_queue_flush(dma_q);
 }
 
+// Same as the pp kernel, but the K > 1 snapshots are copied VTCM->VTCM and written to DDR by async DMA (pure data movement).
+struct gdn_seq_q {
+    dma_queue * q;
+    uint32_t    pushed;
+    uint32_t    popped;
+};
+
+static inline uint32_t gdn_seq_push(struct gdn_seq_q * s, dma_data d, size_t row, size_t nrows) {
+    dma_queue_push(s->q, d, row, row, row, nrows);
+    return s->pushed++;
+}
+
+static inline void gdn_seq_wait(struct gdn_seq_q * s, uint32_t seq) {
+    while (s->popped <= seq) {
+        dma_queue_pop(s->q);
+        s->popped++;
+    }
+}
+
+static void gated_delta_net_f32_pp_snap_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
+    struct htp_ops_context * octx = gctx->octx;
+    const struct htp_gdn_kernel_params * kparams = gctx->kparams;
+
+    const struct htp_tensor * q     = octx->src[0];
+    const struct htp_tensor * k     = octx->src[1];
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * g     = octx->src[3];
+    const struct htp_tensor * beta  = octx->src[4];
+    const struct htp_tensor * state = octx->src[5];
+    const struct htp_tensor * dst   = octx->dst;
+
+    const uint32_t S_v      = kparams->S_v;
+    const uint32_t H        = kparams->H;
+    const uint32_t n_tokens = kparams->n_tokens;
+    const uint32_t n_seqs   = kparams->n_seqs;
+    const uint32_t K        = kparams->K;
+    const uint32_t row_end  = gctx->row_start + gctx->nrows;
+
+    if (ith >= gctx->nrows) {
+        return;
+    }
+
+    const struct htp_tensor * dst_cache = octx->dsts[1];
+    const float scale = kparams->scale;
+    float * dst_base       = (float *) (uintptr_t) dst->data;
+    float * state_out_base = dst_cache ? (float *) (uintptr_t) dst_cache->data : (dst_base + S_v * H * n_tokens * n_seqs);
+
+    struct gdn_seq_q sq = { octx->ctx->dma[ith], 0, 0 };
+    const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
+    float * s_work[2];
+    s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_thread * ith);
+    s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
+    float * s_snap = s_work[1] + layout->state_aligned / sizeof(float);
+
+    const struct fastdiv_values * fd_H   = &kparams->div_H;
+    const struct fastdiv_values * fd_q1  = &kparams->div_q1;
+    const struct fastdiv_values * fd_k1  = &kparams->div_k1;
+    const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
+    const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
+
+    const uint32_t state_seq_stride = kparams->state_seq_stride;
+    const uint64_t state_size_per_snap = (uint64_t) kparams->state_size_per_snap;
+    const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_tokens * n_seqs * sizeof(float));
+    const size_t row_bytes = S_v * sizeof(float);
+
+    uint32_t ir_prefetch = gctx->row_start + ith;
+    int spad_idx = 0;
+    uint32_t fseq[2] = { 0, 0 };
+    bool have_snap = false;
+    uint32_t snap_seq = 0;
+
+    for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
+        const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+        const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+        dma_addr_t ps_in = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
+        fseq[spad_idx] = gdn_seq_push(&sq, dma_make_data(s_work[spad_idx], ps_in), row_bytes, S_v);
+        ir_prefetch += nth;
+        spad_idx ^= 1;
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    int curr_spad_idx = 0;
+    for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
+        gdn_seq_wait(&sq, fseq[curr_spad_idx]);
+
+        float * s_work_curr = s_work[curr_spad_idx];
+
+        const uint32_t iv1 = fastmodulo(ir, H, fd_H);
+        const uint32_t iv3 = fastdiv(ir, fd_H);
+
+        const uint32_t iq1 = fastmodulo(iv1, q->ne[1], fd_q1);
+        const uint32_t ik1 = fastmodulo(iv1, k->ne[1], fd_k1);
+        const uint32_t iq3 = fastdiv(iv3, fd_rq3);
+        const uint32_t ik3 = fastdiv(iv3, fd_rk3);
+
+        dma_addr_t s_out  = state_out_dma_base + ((uint64_t) iv3 * H + iv1) * S_v * S_v * sizeof(float);
+        float * attn_data = dst_base + ((uint64_t) iv3 * n_tokens * H + iv1) * S_v;
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const float * q_t = (const float *) ((const uint8_t *) (uintptr_t) q->data +
+                    (uint64_t) iq3 * q->nb[3] + (uint64_t) t * q->nb[2] + (uint64_t) iq1 * q->nb[1]);
+            const float * k_t = (const float *) ((const uint8_t *) (uintptr_t) k->data +
+                    (uint64_t) ik3 * k->nb[3] + (uint64_t) t * k->nb[2] + (uint64_t) ik1 * k->nb[1]);
+            const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
+                    (uint64_t) iv3 * v->nb[3] + (uint64_t) t * v->nb[2] + (uint64_t) iv1 * v->nb[1]);
+            const float * g_t = (const float *) ((const uint8_t *) (uintptr_t) g->data +
+                    (uint64_t) iv3 * g->nb[3] + (uint64_t) t * g->nb[2] + (uint64_t) iv1 * g->nb[1]);
+            const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                    (uint64_t) iv3 * beta->nb[3] + (uint64_t) t * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+
+            gdn_step_scalar_f32(s_work_curr, attn_data, q_t, k_t, v_t, g_t, beta_val, scale, S_v);
+
+            const int64_t target_slot = (int64_t) n_tokens - 1 - (int64_t) t;
+            if (K > 1 && target_slot > 0 && target_slot < (int64_t) K) {
+                if (have_snap) {
+                    gdn_seq_wait(&sq, snap_seq);
+                }
+                hvx_copy_f32_aa((uint8_t *) s_snap, (const uint8_t *) s_work_curr, S_v * S_v);
+                float * curr_state_o = state_out_base + (uint64_t) target_slot * state_size_per_snap + ((uint64_t) iv3 * H + iv1) * S_v * S_v;
+                snap_seq  = gdn_seq_push(&sq, dma_make_data((dma_addr_t) (uintptr_t) curr_state_o, s_snap), row_bytes, S_v);
+                have_snap = true;
+            }
+
+            attn_data += (uint64_t) S_v * H;
+        }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+
+        gdn_seq_push(&sq, dma_make_data(s_out, s_work_curr), row_bytes, S_v);
+
+        // The DMA queue is FIFO: the prefetch into the buffer just written back runs after that write-back.
+        if (ir_prefetch < row_end) {
+            const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+            const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+            dma_addr_t ps_in = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
+            fseq[spad_idx] = gdn_seq_push(&sq, dma_make_data(s_work[spad_idx], ps_in), row_bytes, S_v);
+            ir_prefetch += nth;
+            spad_idx ^= 1;
+        }
+
+        curr_spad_idx ^= 1;
+    }
+    while (sq.popped < sq.pushed) {
+        dma_queue_pop(sq.q);
+        sq.popped++;
+    }
+}
+
 static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
     struct htp_ops_context * octx = gctx->octx;
@@ -2332,6 +2482,11 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     gctx.nrows     = nrows;
 
     htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_threads);
+    const bool snap_dma = kparams->kernel_type == HTP_GDN_KERNEL_HVX_RECURRENT_SNAP && n_tokens > 1;
+    if (snap_dma) {
+        gctx.layout.bytes_per_thread += gctx.layout.state_aligned;
+        gctx.layout.total_bytes       = gctx.layout.bytes_per_thread * n_threads;
+    }
     gctx.vtcm_base = VTCM_LAYOUT_PTR(uint8_t, octx->ctx->vtcm_base, gctx.layout.off_state);
 
     if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
@@ -2349,6 +2504,8 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     if (n_tokens == 1) {
         work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_tg_thread, &gctx, n_threads);
+    } else if (snap_dma) {
+        work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_pp_snap_thread, &gctx, n_threads);
     } else {
         work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_pp_thread, &gctx, n_threads);
     }
