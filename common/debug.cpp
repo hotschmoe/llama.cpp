@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <regex>
 #include <string>
 #include <vector>
@@ -179,6 +181,21 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
+    }
+
+    // raw dump of matching F32 tensors (fixtures): COMMON_DEBUG_DUMP_DIR=<dir> COMMON_DEBUG_DUMP_RE=<regex on tensor name>
+    {
+        static const char * dump_dir = getenv("COMMON_DEBUG_DUMP_DIR");
+        static const char * dump_re  = getenv("COMMON_DEBUG_DUMP_RE");
+        if (dump_dir && dump_re && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+                std::regex_search(t->name, std::regex(dump_re))) {
+            const std::string path = std::string(dump_dir) + "/" + t->name + ".f32";
+            if (FILE * f = fopen(path.c_str(), "ab")) {
+                const uint8_t * d = is_host ? (const uint8_t *) t->data : pimpl->data.data();
+                fwrite(d, 1, ggml_nbytes(t), f);
+                fclose(f);
+            }
+        }
     }
 
     if (!ggml_is_quantized(t->type) && matches_filter) {

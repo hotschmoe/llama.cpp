@@ -3,6 +3,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <numeric>
 
 void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
@@ -125,7 +126,15 @@ static void clover_sort_rows(ggml_tensor * dst, int ith, int nth, void *) {
 ggml_tensor * llama_model_clover_moe::graph::build_clover_top_k(ggml_tensor * logits, int64_t k) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float));
     GGML_ASSERT(k > 0 && k <= logits->ne[0]);
-    // Clover requires lower expert IDs first on ties; backend argsort does not guarantee this.
+    // CLOVER_TOPK_CUSTOM=1 selects the old host-only sort (A/B and fallback)
+    static const bool use_custom = getenv("CLOVER_TOPK_CUSTOM") != nullptr;
+    if (!use_custom) {
+        // stable sort of the whole row (descending, lower expert id first on ties) + view of the first k:
+        // same ids layout (row stride ne0) as the custom op below and as ggml_argsort_top_k consumers expect
+        auto * order = ggml_top_k_stable(ctx0, logits, logits->ne[0]);
+        return k == logits->ne[0] ? order :
+            ggml_view_4d(ctx0, order, k, order->ne[1], order->ne[2], order->ne[3], order->nb[1], order->nb[2], order->nb[3], 0);
+    }
     auto * order = ggml_custom_4d(ctx0, GGML_TYPE_I32, logits->ne[0], logits->ne[1], logits->ne[2], logits->ne[3],
             &logits, 1, clover_sort_rows, GGML_N_TASKS_MAX, nullptr);
     return ggml_view_4d(ctx0, order, k, order->ne[1], order->ne[2], order->ne[3], order->nb[1], order->nb[2], order->nb[3], 0);
@@ -202,6 +211,11 @@ ggml_tensor * llama_model_clover_moe::graph::build_clover(
 }
 
 ggml_tensor * llama_model_clover_moe::graph::build_clover_coreset(ggml_tensor * logits) {
+    // SPOOF (bound experiments only, changes results): CLOVER_CORESET_SPOOF=skip returns the unmasked logits
+    static const bool spoof_skip = getenv("CLOVER_CORESET_SPOOF") != nullptr;
+    if (spoof_skip) {
+        return logits;
+    }
     const int64_t width = logits->ne[1];
 
     auto * probs    = ggml_soft_max(ctx0, logits);
