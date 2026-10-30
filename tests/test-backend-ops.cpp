@@ -12769,6 +12769,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // BEGIN port agent: Clover/Qwen3.6-35B-A3B decode and 16-token block shapes
+    for (int n : {1, 4, 16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+    }
+    for (int64_t K : {1, 6, 16}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 16, 1, 1, false, false, K));
+    }
+    // END port agent
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
