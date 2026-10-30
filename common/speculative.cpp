@@ -1508,6 +1508,10 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
     //  1: the pass advances it, so the recurrent state is checkpointed and restored around every pass
     int ckpt_mode = -1;
 
+    // research knob (LLAMA_DRAFT_SELF_MARGIN, off by default): end the draft at the first position whose top-1 - top-2
+    // logit margin is below this value, so the verify forward only carries the confident prefix
+    float margin_min = -1.0f;
+
     // per-phase wall time of the draft pass (us): checkpoint save, masked-block decode, argmax, restore
     int64_t t_save_us = 0, t_decode_us = 0, t_argmax_us = 0, t_restore_us = 0;
     int32_t n_passes  = 0;
@@ -1535,6 +1539,9 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
 
         if (const char * env = getenv("LLAMA_DRAFT_SELF_CKPT")) {
             ckpt_mode = atoi(env) ? 1 : -1;
+        }
+        if (const char * env = getenv("LLAMA_DRAFT_SELF_MARGIN")) {
+            margin_min = (float) atof(env);
         }
     }
 
@@ -1579,9 +1586,28 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
             t_decode_us += t0 - t1;
             n_passes++;
             if (ret == 0) {
+                const int n_vocab = llama_vocab_n_tokens(vocab);
                 for (int i = 0; i < count; ++i) {
                     const float * logits = llama_get_logits_ith(ctx, i + 1);
-                    const llama_token token = std::max_element(logits, logits + llama_vocab_n_tokens(vocab)) - logits;
+                    llama_token token;
+                    if (margin_min > 0.0f) {
+                        // first maximum, like std::max_element, plus the runner-up value
+                        float v1 = logits[0], v2 = -INFINITY;
+                        token = 0;
+                        for (int j = 1; j < n_vocab; ++j) {
+                            const float x = logits[j];
+                            if (x > v1) {
+                                v2 = v1; v1 = x; token = j;
+                            } else if (x > v2) {
+                                v2 = x;
+                            }
+                        }
+                        if (i > 0 && v1 - v2 < margin_min) {
+                            break;
+                        }
+                    } else {
+                        token = std::max_element(logits, logits + n_vocab) - logits;
+                    }
                     dp.result->push_back(token);
                     if (dp.result_q) {
                         dp.result_q->push_back({{token, 0.0f, 1.0f}});
