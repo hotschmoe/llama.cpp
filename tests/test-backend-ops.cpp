@@ -10108,13 +10108,24 @@ struct test_clover_top_k : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(seed);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t != input) {
+                init_tensor_uniform(t); // sentinels
+                continue;
+            }
             std::vector<float> all(ggml_nelements(t));
             if (pattern == CTK_FIXTURE) {
                 std::ifstream f(fixture, std::ios::binary);
                 GGML_ASSERT(f.good() && "CLOVER_TOPK_FIXTURE file not readable");
-                f.seekg(fixture_off * t->ne[0] * sizeof(float));
-                f.read((char *) all.data(), all.size() * sizeof(float));
-                GGML_ASSERT((size_t) f.gcount() == all.size() * sizeof(float) && "fixture too short");
+                std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                const size_t off_b = (size_t) fixture_off * (size_t) t->ne[0] * sizeof(float);
+                if (off_b + all.size() * sizeof(float) > raw.size()) {
+                    fprintf(stderr, "fixture %s: need %zu bytes at %zu, file has %zu\n", fixture.c_str(), all.size() * sizeof(float), off_b, raw.size());
+                    GGML_ABORT("fixture too short");
+                }
+                memcpy(all.data(), raw.data() + off_b, all.size() * sizeof(float));
             } else {
                 std::vector<float> row(t->ne[0]);
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
