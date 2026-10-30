@@ -572,6 +572,13 @@ static bool htp_kparams_solve_gated_delta_net(
         kparams->pipeline      = 0;
         kparams->n_heads_batch = 1;
         kparams->vtcm_size     = (uint32_t) hvx_layout.total_bytes;
+
+        // third per-thread state buffer for snapshot DMA
+        const size_t snap_bytes = (hvx_layout.bytes_per_thread + hvx_layout.state_aligned) * n_threads;
+        if (opt_gdn_snapdma && n_tokens > 1 && K > 1 && g->ne[0] == 1 && snap_bytes <= vtcm_size) {
+            kparams->kernel_type = HTP_GDN_KERNEL_HVX_RECURRENT_SNAP;
+            kparams->vtcm_size   = (uint32_t) snap_bytes;
+        }
     }
 
     kparams->n_threads           = n_threads;
