@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "debug.h"
 
 #include "../src/llama-ext.h"
 
@@ -1763,6 +1764,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    const char * tensor_trace = std::getenv("LLAMA_TENSOR_TRACE_FILE");
+    if (tensor_trace && *tensor_trace) {
+        GGML_ASSERT(!cparams.cb_eval);
+        cparams.cb_eval = common_debug_tensor_trace;
+        cparams.cb_eval_user_data = nullptr;
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

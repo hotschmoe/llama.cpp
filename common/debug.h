@@ -17,6 +17,9 @@ struct common_params;
 // The callback data will be passed as the third parameter (user_data)
 bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data);
 
+// binary dump of tensors matching LLAMA_TENSOR_TRACE_FILTER to LLAMA_TENSOR_TRACE_FILE (installed by common_context_params_to_llama)
+bool common_debug_tensor_trace(struct ggml_tensor * t, bool ask, void * user_data);
+
 struct common_debug_cb_user_data {
     struct impl;
     std::unique_ptr<impl> pimpl;

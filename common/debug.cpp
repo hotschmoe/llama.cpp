@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <vector>
@@ -15,6 +16,42 @@ struct common_debug_cb_user_data::impl {
     std::vector<std::regex> tensor_filters;
     bool                    abort_on_nan{false};
 };
+
+// binary trace record: magic, name_size, type, op, ne[4], nb[4], bytes, name, data (read by npu_campaign/compare_tensor_traces.py)
+bool common_debug_tensor_trace(struct ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    static const std::regex filter([] {
+        const char * pattern = std::getenv("LLAMA_TENSOR_TRACE_FILTER");
+        return pattern && *pattern ? pattern : "(-0$|-1$|token_embd)";
+    }());
+    if (ask) { return std::regex_search(t->name, filter); }
+    static FILE * file = [] {
+        const char * path = std::getenv("LLAMA_TENSOR_TRACE_FILE");
+        FILE * result = path && *path ? std::fopen(path, "wb") : nullptr;
+        GGML_ASSERT(result);
+        return result;
+    }();
+    const uint32_t magic = 0x54524331;
+    const uint32_t name_size = (uint32_t) std::strlen(t->name);
+    const uint32_t type = (uint32_t) t->type;
+    const uint32_t op = (uint32_t) t->op;
+    const uint64_t bytes = ggml_nbytes(t);
+    uint64_t strides[4];
+    for (int i = 0; i < 4; ++i) { strides[i] = t->nb[i]; }
+    std::vector<uint8_t> data(bytes);
+    ggml_backend_tensor_get(t, data.data(), 0, bytes);
+    GGML_ASSERT(std::fwrite(&magic, 4, 1, file) == 1);
+    GGML_ASSERT(std::fwrite(&name_size, 4, 1, file) == 1);
+    GGML_ASSERT(std::fwrite(&type, 4, 1, file) == 1);
+    GGML_ASSERT(std::fwrite(&op, 4, 1, file) == 1);
+    GGML_ASSERT(std::fwrite(t->ne, 8, 4, file) == 4);
+    GGML_ASSERT(std::fwrite(strides, 8, 4, file) == 4);
+    GGML_ASSERT(std::fwrite(&bytes, 8, 1, file) == 1);
+    GGML_ASSERT(std::fwrite(t->name, 1, name_size, file) == name_size);
+    GGML_ASSERT(std::fwrite(data.data(), 1, bytes, file) == bytes);
+    GGML_ASSERT(std::fflush(file) == 0);
+    return true;
+}
 
 common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
 common_debug_cb_user_data::~common_debug_cb_user_data() = default;
