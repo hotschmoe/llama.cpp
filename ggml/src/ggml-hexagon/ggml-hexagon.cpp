@@ -150,9 +150,16 @@ int    opt_opqueue   = 8;    // max number of pending batches
 int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
 int    opt_oppoll    = 0;    // polling for batch completions
 int    opt_opfusion  = 1;    // enable/disable op fusion
+int    opt_graph_cache = 1;  // number of per-split graphs whose solved op nodes are kept (1 = last graph only)
+int    opt_hoststat  = 0;    // print host-side time accounting at session release
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
+
+struct ggml_hexagon_hoststat {
+    std::atomic<uint64_t> n_hit{0}, n_miss{0}, n_ops{0}, us_compute{0}, us_solve{0}, us_enq{0}, us_wait{0}, n_wait{0};
+};
+static ggml_hexagon_hoststat g_hoststat;
 
 static const char * status_to_str(uint32_t status) {
     switch (status) {
@@ -335,8 +342,7 @@ struct ggml_hexagon_session {
     std::atomic<uint64_t> batch_rsp_seq{0};
     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
 
-    uint64_t                cached_uid = 0;
-    std::vector<htp_opnode> cached_nodes;
+    std::unordered_map<uint64_t, std::vector<htp_opnode>> graph_cache;
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -1727,7 +1733,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
         // Read response packet from queue
         const uint32_t timeo = (opt_oppoll && !spin_off) ? 0 : DSPQUEUE_TIMEOUT;
 
+        const int64_t t_rd0 = opt_hoststat ? ggml_time_us() : 0;
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
+        if (opt_hoststat) { g_hoststat.us_wait += ggml_time_us() - t_rd0; g_hoststat.n_wait++; }
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
             const int64_t waited = ggml_time_us() - wait_t0;
             if (opt_oppoll && !spin_off && waited > spin_limit_us) {
@@ -2276,6 +2284,12 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 }
 
 void ggml_hexagon_session::release() noexcept(true) {
+    if (opt_hoststat) {
+        GGML_LOG_INFO("ggml-hex: hoststat: graphs hit %llu miss %llu, ops %llu, graph_compute %.1f ms (solve %.1f ms, enqueue %.1f ms), dspqueue_read wait %.1f ms in %llu reads\n",
+                      (unsigned long long) g_hoststat.n_hit.load(), (unsigned long long) g_hoststat.n_miss.load(), (unsigned long long) g_hoststat.n_ops.load(),
+                      g_hoststat.us_compute.load() / 1e3, g_hoststat.us_solve.load() / 1e3, g_hoststat.us_enq.load() / 1e3,
+                      g_hoststat.us_wait.load() / 1e3, (unsigned long long) g_hoststat.n_wait.load());
+    }
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     this->mdev.sessions.clear();
@@ -2391,10 +2405,14 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
-    bool cache_hit = (graph->uid != 0 && sess->cached_uid == graph->uid);
-    if (cache_hit) {
-        nodes_ptr = &sess->cached_nodes;
+    const int64_t t_start = opt_hoststat ? ggml_time_us() : 0;
+
+    auto cached = graph->uid != 0 ? sess->graph_cache.find(graph->uid) : sess->graph_cache.end();
+    if (cached != sess->graph_cache.end()) {
+        nodes_ptr = &cached->second;
+        g_hoststat.n_hit++;
     } else {
+        g_hoststat.n_miss++;
         htp_fusion_tag_graph(graph);
 
         computed_nodes.reserve(graph->n_nodes);
@@ -2432,16 +2450,34 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
 
         if (graph->uid != 0) {
-            sess->cached_uid   = graph->uid;
-            sess->cached_nodes = std::move(computed_nodes);
-            nodes_ptr = &sess->cached_nodes;
+            if ((int) sess->graph_cache.size() >= opt_graph_cache) {
+                sess->graph_cache.clear();
+            }
+            auto & slot = sess->graph_cache[graph->uid];
+            slot        = std::move(computed_nodes);
+            nodes_ptr   = &slot;
         } else {
             nodes_ptr = &computed_nodes;
         }
     }
 
+    const int64_t t_solved = opt_hoststat ? ggml_time_us() : 0;
+    g_hoststat.n_ops += nodes_ptr->size();
+
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
+    }
+    if (opt_hoststat) {
+        const int64_t t_end = ggml_time_us();
+        g_hoststat.us_solve += t_solved - t_start;
+        g_hoststat.us_enq   += t_end - t_solved;
+        g_hoststat.us_compute += t_end - t_start;
+        if ((g_hoststat.n_hit + g_hoststat.n_miss) % 500 == 0) {
+            GGML_LOG_INFO("ggml-hex: hoststat: graphs hit %llu miss %llu, ops %llu, graph_compute %.1f ms (solve %.1f ms, enqueue %.1f ms), dspqueue_read wait %.1f ms in %llu reads\n",
+                          (unsigned long long) g_hoststat.n_hit.load(), (unsigned long long) g_hoststat.n_miss.load(), (unsigned long long) g_hoststat.n_ops.load(),
+                          g_hoststat.us_compute.load() / 1e3, g_hoststat.us_solve.load() / 1e3, g_hoststat.us_enq.load() / 1e3,
+                          g_hoststat.us_wait.load() / 1e3, (unsigned long long) g_hoststat.n_wait.load());
+        }
     }
 
     if (sess->last_error > HTP_STATUS_OK) {
@@ -3489,6 +3525,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
     if (const char * str_gdn_snapdma = getenv("GGML_HEXAGON_GDN_SNAPDMA")) { opt_gdn_snapdma = atoi(str_gdn_snapdma); }
+    if (const char * str_gc = getenv("GGML_HEXAGON_GRAPH_CACHE")) { opt_graph_cache = std::max(1, atoi(str_gc)); }
+    if (const char * str_hs = getenv("GGML_HEXAGON_HOSTSTAT")) { opt_hoststat = atoi(str_hs); }
     opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
     opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
 
