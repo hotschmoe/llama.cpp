@@ -158,10 +158,17 @@ int main(int argc, char ** argv) {
 
     // per-phase wall time (us) and forward counts; a re-verify is a verify of a draft rebuilt from a restored checkpoint
     struct {
-        int64_t draft = 0, ckpt_save = 0, verify = 0, reverify = 0, sample = 0, ckpt_load = 0, seq_rm = 0;
-        int32_t n_draft = 0, n_verify = 0, n_reverify = 0;
+        int64_t draft = 0, ckpt_save = 0, verify = 0, reverify = 0, plain = 0, sample = 0, ckpt_load = 0, seq_rm = 0;
+        int32_t n_draft = 0, n_verify = 0, n_reverify = 0, n_plain = 0;
     } prof;
     bool draft_from_ckpt = false;
+
+    // research knobs, off by default:
+    // LLAMA_SPEC_BONUS=1: after a partial acceptance the next step is a plain 1-token decode of the correction token
+    // LLAMA_SPEC_VERIFY_MAX=n: draft (and verify) at most n tokens; the draft-self block width stays n_max + 1
+    const bool spec_bonus = getenv("LLAMA_SPEC_BONUS") && atoi(getenv("LLAMA_SPEC_BONUS")) != 0;
+    const int  verify_max = getenv("LLAMA_SPEC_VERIFY_MAX") ? atoi(getenv("LLAMA_SPEC_VERIFY_MAX")) : -1;
+    bool skip_draft = false;
 
     // optional dump of the committed token ids (one per line) for exactness checks
     FILE * f_tokens = nullptr;
@@ -196,6 +203,9 @@ int main(int argc, char ** argv) {
             if (params.n_predict >= 0) {
                 n_draft_max = std::min(n_draft_max, params.n_predict - n_predict - 1);
             }
+            if (verify_max >= 0) {
+                n_draft_max = std::min(n_draft_max, verify_max);
+            }
             n_draft_max = std::max(n_draft_max, 0);
 
             // generate a new draft
@@ -208,7 +218,10 @@ int main(int argc, char ** argv) {
                 /* .result     = */ &draft, // output
             };
             int64_t t0 = ggml_time_us();
-            common_speculative_draft(spec);
+            if (!skip_draft) {
+                common_speculative_draft(spec);
+            }
+            skip_draft = false;
             int64_t t1 = ggml_time_us();
             prof.draft += t1 - t0;
             prof.n_draft += !draft.empty();
@@ -256,6 +269,9 @@ int main(int argc, char ** argv) {
             if (draft_from_ckpt) {
                 prof.reverify += dt;
                 prof.n_reverify++;
+            } else if (draft.empty()) {
+                prof.plain += dt;
+                prof.n_plain++;
             } else {
                 prof.verify += dt;
                 prof.n_verify++;
@@ -324,6 +340,10 @@ int main(int argc, char ** argv) {
         }
 
         common_speculative_accept(spec, seq_id, ids.size() - 1);
+
+        if (spec_bonus && !use_ckpt_tgt && n_draft > 0 && ids.size() - 1 < n_draft) {
+            skip_draft = true;
+        }
 
         // full acceptance: consume the draft and commit accepted tokens
         n_past    += ids.size() - 1;
@@ -403,18 +423,19 @@ int main(int argc, char ** argv) {
 
     {
         const double t_dec = (t_dec_end - t_dec_start) / 1e3;
-        const int n_fwd = prof.n_draft + prof.n_verify + prof.n_reverify;
+        const int n_fwd = prof.n_draft + prof.n_verify + prof.n_reverify + prof.n_plain;
         LOG_INF("\n");
-        LOG_INF("spec prof: decode %.1f ms, %d tokens, forwards: draft %d, verify %d, re-verify %d -> %.3f forwards/token\n",
-                t_dec, n_predict, prof.n_draft, prof.n_verify, prof.n_reverify, n_predict > 0 ? (double) n_fwd / n_predict : 0.0);
+        LOG_INF("spec prof: decode %.1f ms, %d tokens, forwards: draft %d, verify %d, re-verify %d, plain %d -> %.3f forwards/token\n",
+                t_dec, n_predict, prof.n_draft, prof.n_verify, prof.n_reverify, prof.n_plain, n_predict > 0 ? (double) n_fwd / n_predict : 0.0);
         LOG_INF("spec prof: draft %.1f ms (%.2f/call), verify %.1f ms (%.2f/call), re-verify %.1f ms (%.2f/call)\n",
                 prof.draft / 1e3, prof.draft / 1e3 / std::max(1, prof.n_draft),
                 prof.verify / 1e3, prof.verify / 1e3 / std::max(1, prof.n_verify),
                 prof.reverify / 1e3, prof.reverify / 1e3 / std::max(1, prof.n_reverify));
+        LOG_INF("spec prof: plain 1-token decode %.1f ms (%.2f/call)\n", prof.plain / 1e3, prof.plain / 1e3 / std::max(1, prof.n_plain));
         LOG_INF("spec prof: ckpt save %.1f ms, ckpt load %.1f ms, sample %.1f ms, seq_rm %.1f ms, other %.1f ms\n",
                 prof.ckpt_save / 1e3, prof.ckpt_load / 1e3, prof.sample / 1e3, prof.seq_rm / 1e3,
-                t_dec - (prof.draft + prof.ckpt_save + prof.verify + prof.reverify + prof.sample + prof.ckpt_load + prof.seq_rm) / 1e3);
-        LOG_INF("spec prof: tokens/step %.3f (steps = non-re-verify forwards)\n", prof.n_verify > 0 ? (double) n_predict / prof.n_verify : 0.0);
+                t_dec - (prof.draft + prof.ckpt_save + prof.verify + prof.reverify + prof.plain + prof.sample + prof.ckpt_load + prof.seq_rm) / 1e3);
+        LOG_INF("spec prof: tokens/step %.3f (steps = verify forwards of a fresh draft)\n", prof.n_verify > 0 ? (double) n_predict / prof.n_verify : 0.0);
     }
 
     LOG_INF("\n");
