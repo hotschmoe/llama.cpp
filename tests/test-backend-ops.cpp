@@ -3592,6 +3592,128 @@ struct test_cpy_bf16_mm : public test_case {
     }
 };
 
+// Synthetic stack of Clover-like layers in ONE graph (long HTP-resident chain with many bf16 rounds), width = tokens.
+// layer: a = round(x); n = rms_norm(a) * w; y = W2 * silu(W1 * n); x = a + round(y); then round(x) feeds the next layer.
+struct test_cpy_bf16_stack : public test_case {
+    const int64_t hidden, ffn, width;
+    const int n_layers;
+    const bool use_round;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BF16_STACK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(hidden, ffn, width, n_layers, use_round);
+    }
+
+    double max_nmse_err() override { return 1e-2; }
+
+    test_cpy_bf16_stack(int64_t hidden, int64_t ffn, int64_t width, int n_layers, bool use_round = true)
+        : hidden(hidden), ffn(ffn), width(width), n_layers(n_layers), use_round(use_round) {}
+
+    ggml_tensor * rnd(ggml_context * ctx, ggml_tensor * t) const {
+        return use_round ? ggml_cast(ctx, ggml_cast(ctx, t, GGML_TYPE_BF16), GGML_TYPE_F32) : t;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, width);
+        ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hidden, ffn);
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ffn, hidden);
+        ggml_set_name(x, "x"); ggml_set_name(w, "w"); ggml_set_name(w1, "w1"); ggml_set_name(w2, "w2");
+        for (int il = 0; il < n_layers; il++) {
+            ggml_tensor * a = rnd(ctx, x);
+            ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+            ggml_tensor * y = ggml_mul_mat(ctx, w2, ggml_silu(ctx, ggml_mul_mat(ctx, w1, n)));
+            x = ggml_add(ctx, a, rnd(ctx, y));
+        }
+        return x;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src || t->buffer == nullptr) {
+                continue;
+            }
+            const std::string nm = t->name;
+            if (nm == "w") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (nm == "x") {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -0.03f, 0.03f);
+            }
+        }
+    }
+};
+
+// Clover GDN prefill front end in one graph: rounded conv output -> q/k/v views -> l2 norm + bf16 round -> repeat -> GDN.
+struct test_cpy_bf16_gdn : public test_case {
+    const int64_t T;
+    const bool    use_round;
+    static constexpr int64_t dk = 128, nk = 16, nv = 32, dv = 128;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BF16_GDN";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR2(T, use_round); }
+    double max_nmse_err() override { return 5e-3; }
+
+    test_cpy_bf16_gdn(int64_t T, bool use_round = true) : T(T), use_round(use_round) {}
+
+    ggml_tensor * rnd(ggml_context * ctx, ggml_tensor * t) const {
+        return use_round ? ggml_cast(ctx, ggml_cast(ctx, t, GGML_TYPE_BF16), GGML_TYPE_F32) : t;
+    }
+
+    ggml_tensor * l2n(ggml_context * ctx, ggml_tensor * cur) const {
+        cur = ggml_cont(ctx, cur);
+        ggml_tensor * sq   = ggml_sum_rows(ctx, ggml_sqr(ctx, cur));
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_scale_bias(ctx, sq, 1.0f, 1e-6f));
+        return rnd(ctx, ggml_div(ctx, cur, norm));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ch = 2 * nk * dk + nv * dv;  // 8192
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ch, T);
+        ggml_set_name(x, "x");
+        ggml_tensor * mixed = rnd(ctx, ggml_silu(ctx, x));
+        const size_t nb1 = mixed->nb[1];
+        ggml_tensor * q = ggml_view_4d(ctx, mixed, dk, nk, T, 1, dk * sizeof(float), nb1, nb1 * T, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, mixed, dk, nk, T, 1, dk * sizeof(float), nb1, nb1 * T, dk * nk * sizeof(float));
+        ggml_tensor * v = ggml_view_4d(ctx, mixed, dv, nv, T, 1, dv * sizeof(float), nb1, nb1 * T, 2 * dk * nk * sizeof(float));
+        q = ggml_repeat_4d(ctx, l2n(ctx, q), dk, nv, T, 1);
+        k = ggml_repeat_4d(ctx, l2n(ctx, k), dk, nv, T, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, nv, T, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, nv, T, 1);
+        ggml_tensor * st   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dk, dv, nv, 1);
+        ggml_set_name(g, "g"); ggml_set_name(beta, "beta"); ggml_set_name(st, "state");
+        beta = rnd(ctx, ggml_sigmoid(ctx, beta));
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, st, 1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src || t->buffer == nullptr || ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -3.0f, -1e-3f);
+            } else if (strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else if (strcmp(t->name, "x") == 0) {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
@@ -10422,6 +10544,16 @@ static void add_test_cases_clover(std::vector<std::unique_ptr<test_case>> & test
         for (int64_t width : {1, 13, 16, 256}) {
             test_cases.emplace_back(new test_cpy_bf16_mm(mode, 128, 128, 32, width));
         }
+    }
+    // long residual chain with bf16 rounds (hazard hunting: everything stays on the accelerator)
+    for (int64_t width : {1, 2, 16, 256}) {
+        test_cases.emplace_back(new test_cpy_bf16_stack(2048, 512, width, 8, false));
+        test_cases.emplace_back(new test_cpy_bf16_stack(2048, 512, width, 8, true));
+    }
+    // GDN front end fed by bf16 rounds (hazard hunting)
+    for (int64_t T : {1, 2, 13, 16, 64}) {
+        test_cases.emplace_back(new test_cpy_bf16_gdn(T, false));
+        test_cases.emplace_back(new test_cpy_bf16_gdn(T, true));
     }
     for (const auto & ne : edge_shapes) {
         for (auto mode : {test_cpy_bf16::F32_TO_BF16, test_cpy_bf16::BF16_TO_F32, test_cpy_bf16::PAIR}) {

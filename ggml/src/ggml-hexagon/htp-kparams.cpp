@@ -2607,6 +2607,13 @@ bool htp_kparams_solve_cpy_ex(
     if (is_bf16_cpy && getenv("GGML_HEXAGON_BF16_PREFLUSH")) {
         kparams->flags |= HTP_COPY_FLAG_PREFLUSH;
     }
+    // the DSP data cache must not keep or see stale lines of what the DMA just wrote (cached readers such as REPEAT follow); off only for A/B
+    if (is_bf16_cpy && !getenv("GGML_HEXAGON_BF16_NOPOSTFLUSH")) {
+        kparams->flags |= HTP_COPY_FLAG_POSTFLUSH;
+    }
+    if (is_bf16_cpy && getenv("GGML_HEXAGON_BF16_FLUSHALL")) {
+        kparams->flags |= HTP_COPY_FLAG_FLUSHALL;
+    }
     if (to_bf16 && htp_cpy_bf16_spoil()) {
         kparams->flags |= HTP_COPY_FLAG_BF16_TRUNC;
     }

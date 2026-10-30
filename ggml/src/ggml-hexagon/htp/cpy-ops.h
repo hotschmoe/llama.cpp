@@ -22,6 +22,8 @@ enum htp_copy_kernel_type {
 #define HTP_COPY_FLAG_BF16_ROUND  (1u << 0)  // f32 -> f32 rounded to bf16 precision (fused f32->bf16->f32 pair)
 #define HTP_COPY_FLAG_BF16_TRUNC  (1u << 1)  // NEGATIVE CONTROL ONLY: truncate instead of round-to-nearest-even
 #define HTP_COPY_FLAG_PREFLUSH    (1u << 2)  // DIAGNOSTIC: clean+invalidate the dst range in the DSP cache before writing it
+#define HTP_COPY_FLAG_POSTFLUSH   (1u << 3)  // DIAGNOSTIC: clean+invalidate the dst range after the DMA writes completed
+#define HTP_COPY_FLAG_FLUSHALL    (1u << 4)  // DIAGNOSTIC: clean+invalidate the whole data cache after the op
 
 struct htp_copy_convert_params {
     uint32_t              blk_rows;         // rows moved per DMA descriptor

@@ -302,6 +302,9 @@ static void cpy_thread_##NAME##_flat(unsigned int nth, unsigned int ith, void * 
         }                                                                                              \
     }                                                                                                  \
     dma_queue_flush(dma_q);                                                                            \
+    if (ct->kparams->flags & HTP_COPY_FLAG_POSTFLUSH) {                                                \
+        hex_l2flush((void *) (uintptr_t) (dst->data + (uint64_t) th_start * ds), (size_t) (th_end - th_start) * ds); \
+    }                                                                                                  \
 }
 
 DEFINE_CPY_CONVERT_FLAT(bf16_f32, hvx_copy_bf16_f32_aa)
@@ -474,6 +477,12 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
         hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
     }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+    if (kparams->flags & HTP_COPY_FLAG_POSTFLUSH) {
+        hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
+    }
+    if (kparams->flags & HTP_COPY_FLAG_FLUSHALL) {
+        qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    }
     return HTP_STATUS_OK;
 }
 
@@ -539,6 +548,9 @@ static int cpy_contig_convert(struct htp_ops_context * octx, const struct htp_co
         hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
     }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+    if (kparams->flags & HTP_COPY_FLAG_FLUSHALL) {
+        qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    }
     return HTP_STATUS_OK;
 }
 
@@ -586,6 +598,12 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
         hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
     }
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+    if (kparams->flags & HTP_COPY_FLAG_POSTFLUSH) {
+        hex_l2flush((void *) (uintptr_t) dst->data, (size_t) dst->size);
+    }
+    if (kparams->flags & HTP_COPY_FLAG_FLUSHALL) {
+        qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    }
     return HTP_STATUS_OK;
 }
 
