@@ -2577,6 +2577,11 @@ bool htp_kparams_solve_cpy_ex(
 
     const bool is_bf16_cpy = round_bf16 || src0->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_BF16;
     if (is_bf16_cpy) {
+        // OFF by default: a model run with all casts on HTP is still not repeatable (see npu_campaign/CLOVER_BF16_LOG.md); opt in with GGML_HEXAGON_BF16_CPY=1
+        static const bool bf16_cpy_on = getenv("GGML_HEXAGON_BF16_CPY") && atoi(getenv("GGML_HEXAGON_BF16_CPY")) != 0;
+        if (!bf16_cpy_on) {
+            return false;
+        }
         // bisection switches (diagnostics only): claim bf16 casts only inside [MIN, MAX] elements
         static const long min_el = getenv("GGML_HEXAGON_BF16_MIN_ELEMS") ? atol(getenv("GGML_HEXAGON_BF16_MIN_ELEMS")) : 0;
         static const long max_el = getenv("GGML_HEXAGON_BF16_MAX_ELEMS") ? atol(getenv("GGML_HEXAGON_BF16_MAX_ELEMS")) : 0;
