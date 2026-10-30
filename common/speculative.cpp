@@ -1503,6 +1503,17 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
     common_prompt_checkpoint checkpoint;
     std::vector<bool> needs_anchor;
 
+    // per-phase wall time of the draft pass (us): checkpoint save, masked-block decode, argmax, restore
+    int64_t t_save_us = 0, t_decode_us = 0, t_argmax_us = 0, t_restore_us = 0;
+    int32_t n_passes  = 0;
+
+    ~common_speculative_impl_draft_self() override {
+        if (n_passes > 0) {
+            LOG_INF("draft-self prof: passes = %d, ckpt save = %.2f ms, decode = %.2f ms, argmax = %.2f ms, restore+seq_rm = %.2f ms (per pass)\n",
+                    n_passes, t_save_us / 1e3 / n_passes, t_decode_us / 1e3 / n_passes, t_argmax_us / 1e3 / n_passes, t_restore_us / 1e3 / n_passes);
+        }
+    }
+
     common_speculative_impl_draft_self(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SELF, n_seq, params.draft.n_max)
         , ctx(params.draft.ctx_tgt)
@@ -1541,13 +1552,20 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
 
             // Restore recurrent state before removing the temporary attention KV suffix,
             // using the same checkpoint mechanism as the caller's verification rollback.
+            int64_t t0 = ggml_time_us();
             checkpoint.update_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            int64_t t1 = ggml_time_us();
+            t_save_us += t1 - t0;
             batch.clear();
             common_speculative_add_masked_block(batch, dp, seq_id, llama_vocab_mask(vocab), n_max + 1, true);
 
             llama_set_causal_attn(ctx, false);
             const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             llama_set_causal_attn(ctx, true);
+            llama_synchronize(ctx);
+            t0 = ggml_time_us();
+            t_decode_us += t0 - t1;
+            n_passes++;
             if (ret == 0) {
                 for (int i = 0; i < count; ++i) {
                     const float * logits = llama_get_logits_ith(ctx, i + 1);
@@ -1558,10 +1576,13 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
                     }
                 }
             }
+            t1 = ggml_time_us();
+            t_argmax_us += t1 - t0;
             if (!checkpoint.load_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                     !llama_memory_seq_rm(llama_get_memory(ctx), seq_id, dp.pos0, -1)) {
                 GGML_ABORT("failed to restore target state after self-drafting");
             }
+            t_restore_us += ggml_time_us() - t1;
             if (ret != 0) {
                 SPC_WRN("self-draft decode failed (%d); continuing without a draft\n", ret);
             }

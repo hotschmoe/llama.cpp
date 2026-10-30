@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
@@ -155,6 +156,19 @@ int main(int argc, char ** argv) {
 
     common_prompt_checkpoint ckpt;
 
+    // per-phase wall time (us) and forward counts; a re-verify is a verify of a draft rebuilt from a restored checkpoint
+    struct {
+        int64_t draft = 0, ckpt_save = 0, verify = 0, reverify = 0, sample = 0, ckpt_load = 0, seq_rm = 0;
+        int32_t n_draft = 0, n_verify = 0, n_reverify = 0;
+    } prof;
+    bool draft_from_ckpt = false;
+
+    // optional dump of the committed token ids (one per line) for exactness checks
+    FILE * f_tokens = nullptr;
+    if (const char * path = getenv("LLAMA_SPEC_TOKENS_OUT")) {
+        f_tokens = fopen(path, "w");
+    }
+
     const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
@@ -193,7 +207,11 @@ int main(int argc, char ** argv) {
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };
+            int64_t t0 = ggml_time_us();
             common_speculative_draft(spec);
+            int64_t t1 = ggml_time_us();
+            prof.draft += t1 - t0;
+            prof.n_draft += !draft.empty();
 
             // save a checkpoint of the target context before evaluating the draft
             // this allows us to restore the state if partial draft acceptance occurs
@@ -202,6 +220,8 @@ int main(int argc, char ** argv) {
                     ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
+            prof.ckpt_save += ggml_time_us() - t1;
+            draft_from_ckpt = false;
 
             // reset the draft context to the checkpoint before verification
             if (ctx_dft) {
@@ -229,7 +249,17 @@ int main(int argc, char ** argv) {
             }
 
 
+            const int64_t t0 = ggml_time_us();
             llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+            llama_synchronize(ctx_tgt);
+            const int64_t dt = ggml_time_us() - t0;
+            if (draft_from_ckpt) {
+                prof.reverify += dt;
+                prof.n_reverify++;
+            } else {
+                prof.verify += dt;
+                prof.n_verify++;
+            }
         }
 
         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
@@ -254,7 +284,9 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
+        const int64_t t_s = ggml_time_us();
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        prof.sample += ggml_time_us() - t_s;
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
@@ -267,11 +299,14 @@ int main(int argc, char ** argv) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
 
             draft = std::move(ids);
+            draft_from_ckpt = true;
 
             {
+                const int64_t t0 = ggml_time_us();
                 GGML_ASSERT(ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+                prof.ckpt_load += ggml_time_us() - t0;
             }
 
             if (ctx_dft) {
@@ -306,6 +341,10 @@ int main(int argc, char ** argv) {
 
             id_last = ids[i];
 
+            if (f_tokens) {
+                fprintf(f_tokens, "%d\n", id_last);
+            }
+
             if (llama_vocab_is_eog(vocab, id_last)) {
                 has_eos = true;
                 break;
@@ -328,7 +367,9 @@ int main(int argc, char ** argv) {
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
+            const int64_t t0 = ggml_time_us();
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, n_past, -1);
+            prof.seq_rm += ggml_time_us() - t0;
 
             if (ctx_dft) {
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
@@ -341,6 +382,10 @@ int main(int argc, char ** argv) {
     }
 
     auto t_dec_end = ggml_time_us();
+
+    if (f_tokens) {
+        fclose(f_tokens);
+    }
 
     const int n_input = inp.size();
 
@@ -355,6 +400,22 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+
+    {
+        const double t_dec = (t_dec_end - t_dec_start) / 1e3;
+        const int n_fwd = prof.n_draft + prof.n_verify + prof.n_reverify;
+        LOG_INF("\n");
+        LOG_INF("spec prof: decode %.1f ms, %d tokens, forwards: draft %d, verify %d, re-verify %d -> %.3f forwards/token\n",
+                t_dec, n_predict, prof.n_draft, prof.n_verify, prof.n_reverify, n_predict > 0 ? (double) n_fwd / n_predict : 0.0);
+        LOG_INF("spec prof: draft %.1f ms (%.2f/call), verify %.1f ms (%.2f/call), re-verify %.1f ms (%.2f/call)\n",
+                prof.draft / 1e3, prof.draft / 1e3 / std::max(1, prof.n_draft),
+                prof.verify / 1e3, prof.verify / 1e3 / std::max(1, prof.n_verify),
+                prof.reverify / 1e3, prof.reverify / 1e3 / std::max(1, prof.n_reverify));
+        LOG_INF("spec prof: ckpt save %.1f ms, ckpt load %.1f ms, sample %.1f ms, seq_rm %.1f ms, other %.1f ms\n",
+                prof.ckpt_save / 1e3, prof.ckpt_load / 1e3, prof.sample / 1e3, prof.seq_rm / 1e3,
+                t_dec - (prof.draft + prof.ckpt_save + prof.verify + prof.reverify + prof.sample + prof.ckpt_load + prof.seq_rm) / 1e3);
+        LOG_INF("spec prof: tokens/step %.3f (steps = non-re-verify forwards)\n", prof.n_verify > 0 ? (double) n_predict / prof.n_verify : 0.0);
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
