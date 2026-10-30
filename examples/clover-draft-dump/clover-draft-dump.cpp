@@ -7,6 +7,11 @@
 //   CLOVER_ANCHOR       anchor token id (default: argmax of the last prompt row)
 //   CLOVER_DRAFT_N      draft block width incl. anchor (default 16, 0 = no draft)
 //   CLOVER_TOKENS_FILE  raw int32 prompt token ids (instead of tokenizing -p/-f)
+//   CLOVER_MULTI_STRIDE S > 0: teacher-forced multi-draft mode (needs CLOVER_TOKENS_FILE). For p = S, 2S, ... while
+//                       p + CLOVER_DRAFT_N <= n_tokens: causal prefill of tokens [p-S, p), save seq 0 state, one draft
+//                       forward with anchor tokens[p] at position p (+ masks), restore the saved state, continue.
+//                       Only the draft rows are written (n_prefill_rows 0, n_draft = n_blocks * CLOVER_DRAFT_N,
+//                       anchor field = -S).
 // File: int32 n_vocab, n_prompt, n_prefill_rows, n_draft, anchor; int32 tokens[n_prompt]; f32 rows (prefill then draft).
 #include "arg.h"
 #include "common.h"
@@ -74,6 +79,70 @@ int main(int argc, char ** argv) {
         tokens = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(vocab), true);
     }
     const int n_prompt = (int) tokens.size();
+    const int stride   = env("CLOVER_MULTI_STRIDE") ? std::atoi(env("CLOVER_MULTI_STRIDE")) : 0;
+    if (stride > 0) {
+        if (n_draft < 1 || stride > (int) llama_n_ubatch(ctx) || n_draft > (int) llama_n_ubatch(ctx)) {
+            LOG_ERR("multi-draft: need 1 <= CLOVER_DRAFT_N, CLOVER_MULTI_STRIDE <= n_ubatch\n");
+            return 1;
+        }
+        const llama_token mask = llama_vocab_mask(vocab);
+        if (mask == LLAMA_TOKEN_NULL) {
+            LOG_ERR("model has no mask token\n");
+            return 1;
+        }
+        std::vector<float>   rows;
+        std::vector<uint8_t> saved;
+        int n_blocks = 0;
+        for (int p = stride; p + n_draft <= n_prompt; p += stride) {
+            common_batch pre(ctx);
+            for (int i = p - stride; i < p; ++i) {
+                pre.add(tokens[i], i, 0, i == p - 1);
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, pre.get())) {
+                LOG_ERR("prefill failed at %d\n", p);
+                return 1;
+            }
+            saved.resize(llama_state_seq_get_size(ctx, 0));
+            if (llama_state_seq_get_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                LOG_ERR("state save failed at %d\n", p);
+                return 1;
+            }
+            common_batch batch(ctx);
+            for (int i = 0; i < n_draft; ++i) {
+                batch.add(i == 0 ? tokens[p] : mask, p + i, 0, true);
+            }
+            llama_set_causal_attn(ctx, false);
+            const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            llama_set_causal_attn(ctx, true);
+            if (ret) {
+                LOG_ERR("draft forward failed at %d (%d)\n", p, ret);
+                return 1;
+            }
+            for (int r = 0; r < n_draft; ++r) {
+                const float * l = llama_get_logits_ith(ctx, r);
+                rows.insert(rows.end(), l, l + n_vocab);
+            }
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+            if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                LOG_ERR("state restore failed at %d\n", p);
+                return 1;
+            }
+            ++n_blocks;
+        }
+        FILE * f = std::fopen(out_path, "wb");
+        if (!f) {
+            LOG_ERR("cannot open %s\n", out_path);
+            return 1;
+        }
+        const int32_t hdr[5] = { n_vocab, n_prompt, 0, n_blocks * n_draft, -stride };
+        std::fwrite(hdr, sizeof(int32_t), 5, f);
+        std::fwrite(tokens.data(), sizeof(llama_token), tokens.size(), f);
+        std::fwrite(rows.data(), sizeof(float), rows.size(), f);
+        std::fclose(f);
+        LOG_INF("clover-draft-dump: multi-draft n_tokens %d stride %d blocks %d x %d rows -> %s\n", n_prompt, stride, n_blocks, n_draft, out_path);
+        llama_backend_free();
+        return 0;
+    }
     if (n_prompt < 1 || n_prompt > (int) llama_n_ubatch(ctx)) {
         LOG_ERR("prompt has %d tokens; must be 1..n_ubatch (%d)\n", n_prompt, (int) llama_n_ubatch(ctx));
         return 1;
