@@ -11,6 +11,7 @@
 #include <memory>
 #include <chrono>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <cstddef>
 #include <stdexcept>
@@ -149,6 +150,10 @@ int    opt_opbatch   = 2048; // max number of ops in a batch
 int    opt_opqueue   = 8;    // max number of pending batches
 int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
 int    opt_oppoll    = 0;    // polling for batch completions
+int    opt_wait      = 0;    // response wait strategy: 0 = dspqueue_read (blocking / OPPOLL), 1 = poll + timed sleep, 2 = packet callback + event
+int    opt_wait_us   = 500;  // WAIT=1: sleep quantum in us (rounded up to the OS timer tick, 0.5 ms on Windows high-res timers)
+int    opt_wait_spin = 0;    // WAIT=1: spin (noblock poll + yield) instead of sleeping when the predicted remaining DSP time is below this (us)
+int    opt_wait_stats = 0;   // print wait statistics at session release
 int    opt_opfusion  = 1;    // enable/disable op fusion
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
 
@@ -337,6 +342,34 @@ struct ggml_hexagon_session {
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
+
+    // response wait state (GGML_HEXAGON_WAIT)
+    struct wait_state {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        uint64_t                n_signals = 0;   // WAIT=2: bumped by the dspqueue packet callback
+#ifdef _WIN32
+        HANDLE                  timer     = nullptr; // WAIT=1: high-resolution waitable timer
+#endif
+        double                  batch_us  = 0;   // EMA of the DSP-side batch time (rsp.usecs)
+        // WAIT=1 per-batch DSP time prediction (see note_submit / predict_left_us)
+        std::unordered_map<uint64_t, float> est;
+        std::vector<uint64_t>   slot_key;
+        std::vector<float>      slot_est;
+        int64_t                 t_head_lb   = 0; // lower bound of the start time of the oldest in-flight batch
+        int64_t                 t_last_miss = 0; // last poll that found no response
+        int64_t                 t_print     = 0;
+        // stats
+        uint64_t n_waits = 0, n_sleeps = 0, n_spins = 0, n_rsps = 0, n_cb = 0;
+        int64_t  wait_us = 0, sleep_us = 0;
+    } wait;
+
+    void wait_sleep(int64_t us);
+    void print_wait_stats(bool force);
+    void note_submit(uint64_t seq, uint64_t key);
+    double predict_left_us(int64_t now) const;
+    bool read_rsp(htp_opbatch_rsp & rsp, dspqueue_buffer & dbuf, bool block);
+    void handle_rsp(const htp_opbatch_rsp & rsp, const dspqueue_buffer & dbuf);
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -1709,46 +1742,206 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    if (opt_wait == 0) {
+        const int64_t t0 = opt_wait_stats ? ggml_time_us() : 0;
+        wait.n_waits += this->batch_rsp_seq < this->batch_req_seq;
+        while (this->batch_rsp_seq < this->batch_req_seq) {
+            struct htp_opbatch_rsp rsp;
+            struct dspqueue_buffer dbuf;
+            if (!read_rsp(rsp, dbuf, !opt_oppoll)) {
+                continue;
+            }
+            handle_rsp(rsp, dbuf);
+            if (!all) break;
+        }
+        if (opt_wait_stats) {
+            wait.wait_us += ggml_time_us() - t0;
+            print_wait_stats(false);
+        }
+        return;
+    }
+
+    // WAIT=1/2: never block inside the driver. Poll with dspqueue_read_noblock and sleep between polls
+    // (WAIT=1: timed sleep, WAIT=2: until the dspqueue packet callback fires). After the first response
+    // drain everything that is already there, so a queue-full wait frees as many slots as possible.
+    if (this->batch_rsp_seq >= this->batch_req_seq) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    bool got_any = false;
+    wait.n_waits++;
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
-        uint32_t               rsp_size;
-        uint32_t               flags;
-
         struct dspqueue_buffer dbuf;
-        uint32_t               n_dbufs;
 
-        // Read response packet from queue
-        const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
+        uint64_t sig = 0;
+        if (opt_wait == 2) {
+            std::lock_guard<std::mutex> lock(wait.mtx);
+            sig = wait.n_signals;
+        }
 
-        int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        if (read_rsp(rsp, dbuf, false)) {
+            handle_rsp(rsp, dbuf);
+            got_any = true;
             continue;
         }
 
-        if (err != 0) {
-            GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
+        if (got_any && !all) {
+            break;
         }
 
-        // Basic sanity checks
-        if (rsp_size != sizeof(rsp) || n_dbufs != 1) {
-            GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
+        if (opt_wait == 2) {
+            std::unique_lock<std::mutex> lock(wait.mtx);
+            wait.cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return wait.n_signals != sig; });
+            wait.n_sleeps++;
+            continue;
         }
 
-        if (rsp.status > HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
-            this->last_error = rsp.status;
-            for (auto & sub : this->mdev.sessions) {
-                sub->last_error = rsp.status;
-            }
+        // WAIT=1: sleep while the DSP has plenty of queued work; spin (noblock poll + yield) through the
+        // last WAIT_SPIN us of a wait that leaves the DSP idle (wait-all, or the last in-flight batch).
+        const int64_t  now        = ggml_time_us();
+        const uint64_t n_inflight = this->batch_req_seq - this->batch_rsp_seq;
+        wait.t_last_miss = now;
+        if (opt_wait_spin > 0 && (all || n_inflight <= 1) && predict_left_us(now) < (double) opt_wait_spin) {
+            wait.n_spins++;
+            std::this_thread::yield();
+            continue;
         }
-
-        op_queue->pop(rsp, dbuf);
-
-        GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
-        this->batch_rsp_seq = rsp.seq;
-
-        if (!all) break;
+        wait_sleep(opt_wait_us);
     }
+    wait.wait_us += ggml_time_us() - t0;
+    if (opt_wait_stats) {
+        print_wait_stats(false);
+    }
+}
+
+void ggml_hexagon_session::print_wait_stats(bool force) {
+    const int64_t now = ggml_time_us();
+    if (!force && now - wait.t_print < 5000000) {
+        return;
+    }
+    wait.t_print = now;
+    // plain stderr: the ggml log callback is gone by the time sessions are released at exit
+    fprintf(stderr, "ggml-hex: %s wait-stats: mode %d rsps %llu waits %llu wait %.3f s sleeps %llu (%.3f s requested) spins %llu callbacks %llu ema-batch %.1f us\n",
+            this->c_name(), opt_wait, (unsigned long long) wait.n_rsps, (unsigned long long) wait.n_waits, wait.wait_us / 1e6,
+            (unsigned long long) wait.n_sleeps, wait.sleep_us / 1e6, (unsigned long long) wait.n_spins,
+            (unsigned long long) wait.n_cb, wait.batch_us);
+}
+
+// Per-batch DSP time prediction for WAIT=1. A batch is keyed by its first/last op node and op count, which is stable
+// across tokens for a reused graph; the estimate is an EMA of the DSP-reported batch time (rsp.usecs).
+static uint64_t ggml_hexagon_batch_key(const htp_opnode * first, const htp_opnode * last, uint32_t n_ops) {
+    uint64_t k = (uint64_t) (uintptr_t) first->node * 0x9E3779B97F4A7C15ull;
+    k ^= (uint64_t) (uintptr_t) last->node + 0x632BE59BD9B4E019ull + (k << 6) + (k >> 2);
+    return k ^ ((uint64_t) n_ops << 48) ^ (uint64_t) first->opcode;
+}
+
+void ggml_hexagon_session::note_submit(uint64_t seq, uint64_t key) {
+    if (opt_wait != 1) {
+        return;
+    }
+    if (wait.slot_key.size() != op_queue->depth) {
+        wait.slot_key.assign(op_queue->depth, 0);
+        wait.slot_est.assign(op_queue->depth, 0.0f);
+    }
+    const size_t slot = (size_t) ((seq - 1) % op_queue->depth);
+    auto it = wait.est.find(key);
+    wait.slot_key[slot] = key;
+    wait.slot_est[slot] = it != wait.est.end() ? it->second : (float) (wait.batch_us > 0 ? wait.batch_us : 200.0);
+    if (this->batch_rsp_seq + 1 == seq) {
+        // nothing else in flight (from the host's view): the DSP cannot have started this batch before now
+        wait.t_head_lb = ggml_time_us();
+    }
+}
+
+double ggml_hexagon_session::predict_left_us(int64_t now) const {
+    if (wait.slot_est.empty()) {
+        return 0.0;
+    }
+    double left = 0.0;
+    for (uint64_t s = this->batch_rsp_seq + 1; s <= this->batch_req_seq; s++) {
+        left += wait.slot_est[(size_t) ((s - 1) % wait.slot_est.size())];
+    }
+    // t_head_lb is a lower bound of the head batch start, so this under-estimates what is left (errs towards spinning)
+    return left - (double) (now - wait.t_head_lb);
+}
+
+bool ggml_hexagon_session::read_rsp(htp_opbatch_rsp & rsp, dspqueue_buffer & dbuf, bool block) {
+    uint32_t rsp_size = 0;
+    uint32_t flags    = 0;
+    uint32_t n_dbufs  = 0;
+
+    int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp,
+                            block ? DSPQUEUE_TIMEOUT : 0);
+    if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        return false;
+    }
+
+    if (err != 0) {
+        GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
+    }
+
+    // Basic sanity checks
+    if (rsp_size != sizeof(rsp) || n_dbufs != 1) {
+        GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
+    }
+    return true;
+}
+
+void ggml_hexagon_session::handle_rsp(const htp_opbatch_rsp & rsp, const dspqueue_buffer & dbuf) {
+    if (rsp.status > HTP_STATUS_OK) {
+        GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
+        this->last_error = rsp.status;
+        for (auto & sub : this->mdev.sessions) {
+            sub->last_error = rsp.status;
+        }
+    }
+
+    op_queue->pop(rsp, dbuf);
+
+    GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
+    this->batch_rsp_seq = rsp.seq;
+
+    wait.n_rsps++;
+    wait.batch_us = wait.batch_us == 0 ? (double) rsp.usecs : 0.9 * wait.batch_us + 0.1 * (double) rsp.usecs;
+
+    if (opt_wait == 1 && !wait.slot_key.empty()) {
+        const size_t slot = (size_t) ((rsp.seq - 1) % wait.slot_key.size());
+        if (wait.est.size() > 65536) {
+            wait.est.clear();
+        }
+        auto it = wait.est.find(wait.slot_key[slot]);
+        if (it == wait.est.end()) {
+            wait.est.emplace(wait.slot_key[slot], (float) rsp.usecs);
+        } else {
+            it->second = 0.5f * it->second + 0.5f * (float) rsp.usecs;
+        }
+        // the next batch was still queued at the last unsuccessful poll, so it started after that
+        wait.t_head_lb = std::max(wait.t_head_lb, wait.t_last_miss);
+    }
+}
+
+void ggml_hexagon_session::wait_sleep(int64_t us) {
+    wait.n_sleeps++;
+    wait.sleep_us += us;
+#ifdef _WIN32
+    if (!wait.timer) {
+        // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+): sub-ms timer without raising the global timer resolution
+        wait.timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+        if (!wait.timer) {
+            wait.timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        }
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG) us * 10; // relative, 100 ns units
+    if (wait.timer && SetWaitableTimer(wait.timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(wait.timer, INFINITE);
+    } else {
+        Sleep(0);
+    }
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+#endif
 }
 
 void ggml_hexagon_session::flush_sync(bool all) {
@@ -1777,6 +1970,9 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (!op_queue->push(req, dbuf, op_batch, seq)) {
         flush_pending(false);
         op_queue->push(req, dbuf, op_batch, seq);
+    }
+    if (opt_wait == 1) {
+        note_submit(seq, ggml_hexagon_batch_key(&op_batch->ops[0], &op_batch->ops[op_batch->n_ops - 1], op_batch->n_ops));
     }
 
     for (auto & sub : this->mdev.sessions) {
@@ -2173,14 +2369,19 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         }
     }
 
-    // Enable FastRPC QoS mode
+    // Enable FastRPC QoS mode (GGML_HEXAGON_QOS: -1 = leave the driver default, else a remote_rpc_latency_flags value; default 1 = RPC_PM_QOS)
     {
-        struct remote_rpc_control_latency l;
-        l.enable = 1;
+        const char * str_qos = getenv("GGML_HEXAGON_QOS");
+        const int    qos     = str_qos ? atoi(str_qos) : 1;
+        if (qos >= 0) {
+            struct remote_rpc_control_latency l;
+            l.enable  = (uint32_t) qos;
+            l.latency = getenv("GGML_HEXAGON_QOS_US") ? (uint32_t) atoi(getenv("GGML_HEXAGON_QOS_US")) : 0;
 
-        int err = remote_handle64_control(this->handle, DSPRPC_CONTROL_LATENCY, (void *) &l, sizeof(l));
-        if (err != 0) {
-            GGML_LOG_WARN("ggml-hex: failed to enable fastrpc QOS mode: 0x%08x\n", (unsigned) err);
+            int err = remote_handle64_control(this->handle, DSPRPC_CONTROL_LATENCY, (void *) &l, sizeof(l));
+            if (err != 0) {
+                GGML_LOG_WARN("ggml-hex: failed to enable fastrpc QOS mode: 0x%08x\n", (unsigned) err);
+            }
         }
     }
 
@@ -2191,11 +2392,21 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     const size_t rsp_q_size = (sizeof(htp_opbatch_rsp) * opt_opqueue * 2) + 1024;
 
     // Now let's setup the DSP queue
+    // WAIT=2: the packet callback only signals the waiting thread; reads stay explicit (non-blocking).
+    auto rsp_callback = [](dspqueue_t, AEEResult, void * ctx) {
+        auto * s = static_cast<ggml_hexagon_session *>(ctx);
+        {
+            std::lock_guard<std::mutex> lock(s->wait.mtx);
+            s->wait.n_signals++;
+            s->wait.n_cb++;
+        }
+        s->wait.cv.notify_all();
+    };
     err = dspqueue_create(this->domain_id,
                           0,              // Flags
                           req_q_size,     // Request  queue size (in bytes)
                           rsp_q_size,     // Response queue size (in bytes)
-                          nullptr,        // Read packet callback (we handle reads explicitly)
+                          opt_wait == 2 ? (dspqueue_callback_t) rsp_callback : nullptr, // Read packet callback
                           nullptr,        // Error callback (we handle errors during reads)
                           (void *) this,  // Callback context
                           &queue);
@@ -2260,6 +2471,16 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
+
+    if (opt_wait_stats) {
+        print_wait_stats(true);
+    }
+#ifdef _WIN32
+    if (wait.timer) {
+        CloseHandle(wait.timer);
+        wait.timer = nullptr;
+    }
+#endif
 
     this->mdev.sessions.clear();
 
@@ -3453,6 +3674,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * HTP_TRACE_MAX_EVENTS + 131072);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+    if (const char * s = getenv("GGML_HEXAGON_WAIT"))       { opt_wait       = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_WAIT_US"))    { opt_wait_us    = (std::max)(1, atoi(s)); }
+    if (const char * s = getenv("GGML_HEXAGON_WAIT_SPIN"))  { opt_wait_spin  = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_WAIT_STATS")) { opt_wait_stats = atoi(s); }
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
