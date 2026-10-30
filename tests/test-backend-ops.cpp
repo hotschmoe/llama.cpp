@@ -34,6 +34,7 @@
 #include <future>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -10006,6 +10007,199 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// ---- BEGIN topk agent (Clover stable top-k) ----
+// GGML_OP_TOP_K with the stable flag: descending, ties -> lower index first. err() checks both backends against an
+// explicit host reference (std::stable_sort), not only against each other.
+// Env: CLOVER_TOPK_FIXTURE=<f32 rows file>[;<file>...] (rows of 256 floats, e.g. captured router logits) adds fixture cases.
+enum clover_topk_pattern {
+    CTK_RANDOM,       // distinct values
+    CTK_TIES_QUANT,   // values in {0,1,2,3}: heavy ties across the k boundary
+    CTK_TIES_DUP,     // half distinct, half copies of those
+    CTK_MASKED,       // many -1e30 (coreset mask) and 2..40 active entries (can be fewer than k)
+    CTK_ZEROS,        // all-equal rows
+    CTK_ZERO_SIGN,    // +0 / -0 mix with a few small values
+    CTK_INF,          // +inf / -inf / finite mix
+    CTK_DENORM,       // denormals and zeros
+    CTK_FIXTURE,      // from file
+};
+
+struct test_clover_top_k : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int k;
+    const clover_topk_pattern pattern;
+    const std::string fixture;
+    const int64_t fixture_off;
+    const uint32_t seed;
+    const bool stable;
+    ggml_tensor * input {};
+
+    std::string vars() override {
+        std::string v = "ne=[" + std::to_string(ne[0]) + "," + std::to_string(ne[1]) + "," + std::to_string(ne[2]) + "," + std::to_string(ne[3]) +
+            "],k=" + std::to_string(k) + ",pat=" + std::to_string((int) pattern) + ",stable=" + std::to_string((int) stable);
+        if (pattern == CTK_FIXTURE) {
+            v += ",off=" + std::to_string(fixture_off);
+        }
+        return v;
+    }
+
+    test_clover_top_k(std::array<int64_t, 4> ne, int k, clover_topk_pattern pattern, uint32_t seed = 1,
+            const std::string & fixture = "", int64_t fixture_off = 0, bool stable = true)
+        : ne(ne), k(k), pattern(pattern), fixture(fixture), fixture_off(fixture_off), seed(seed), stable(stable) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    static void fill_row(std::vector<float> & d, clover_topk_pattern pat, std::mt19937 & rng) {
+        const size_t n = d.size();
+        std::uniform_real_distribution<float> uni(-4.0f, 4.0f);
+        switch (pat) {
+            case CTK_RANDOM:
+                for (auto & x : d) { x = uni(rng); }
+                break;
+            case CTK_TIES_QUANT:
+                for (auto & x : d) { x = (float) (rng() % 4); }
+                break;
+            case CTK_TIES_DUP:
+                for (size_t i = 0; i < n; i++) { d[i] = i < n / 2 ? uni(rng) : d[rng() % (n / 2)]; }
+                std::shuffle(d.begin(), d.end(), rng);
+                break;
+            case CTK_MASKED: {
+                const size_t active = 2 + rng() % 39;
+                for (size_t i = 0; i < n; i++) { d[i] = -1e30f; }
+                for (size_t j = 0; j < active; j++) {
+                    d[rng() % n] = uni(rng);
+                }
+                break;
+            }
+            case CTK_ZEROS:
+                for (auto & x : d) { x = 0.0f; }
+                break;
+            case CTK_ZERO_SIGN:
+                for (auto & x : d) {
+                    const uint32_t r = rng() % 6;
+                    x = r < 2 ? 0.0f : r < 4 ? -0.0f : r == 4 ? 1.0f : -1.0f;
+                }
+                break;
+            case CTK_INF:
+                for (auto & x : d) {
+                    const uint32_t r = rng() % 6;
+                    x = r == 0 ? INFINITY : r == 1 ? -INFINITY : r == 2 ? 0.5f : uni(rng);
+                }
+                break;
+            case CTK_DENORM:
+                for (auto & x : d) {
+                    const uint32_t r = rng() % 6;
+                    x = r == 1 ? 1e-40f : r == 2 ? 2e-40f : r == 3 ? -1e-40f : r == 4 ? 1e-45f : 0.0f;
+                }
+                break;
+            default: break;
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        input = a;
+        ggml_tensor * out = stable ? ggml_top_k_stable(ctx, a, k) : ggml_top_k(ctx, a, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(seed);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> all(ggml_nelements(t));
+            if (pattern == CTK_FIXTURE) {
+                std::ifstream f(fixture, std::ios::binary);
+                GGML_ASSERT(f.good() && "CLOVER_TOPK_FIXTURE file not readable");
+                f.seekg(fixture_off * t->ne[0] * sizeof(float));
+                f.read((char *) all.data(), all.size() * sizeof(float));
+                GGML_ASSERT((size_t) f.gcount() == all.size() * sizeof(float) && "fixture too short");
+            } else {
+                std::vector<float> row(t->ne[0]);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    fill_row(row, pattern, rng);
+                    std::copy(row.begin(), row.end(), all.begin() + r * t->ne[0]);
+                }
+            }
+            ggml_backend_tensor_set(t, all.data(), 0, all.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const int64_t cols = input->ne[0];
+        const int64_t rows = ggml_nrows(input);
+        GGML_ASSERT(n == (size_t) (rows * k));
+        std::vector<float> src(ggml_nelements(input));
+        ggml_backend_tensor_get(input, src.data(), 0, src.size() * sizeof(float));
+        double bad = 0.0;
+        std::vector<int32_t> ref(cols);
+        for (int64_t r = 0; r < rows; r++) {
+            const float * v = src.data() + r * cols;
+            std::iota(ref.begin(), ref.end(), 0);
+            std::stable_sort(ref.begin(), ref.end(), [&](int32_t x, int32_t y) { return v[x] > v[y]; });
+            int64_t ma = 0, mb = 0;
+            for (int c = 0; c < k; c++) {
+                ma += (int32_t) a[r * k + c] != ref[c];
+                mb += (int32_t) b[r * k + c] != ref[c];
+            }
+            if (ma + mb > 0 && bad == 0.0 && getenv("CLOVER_TOPK_VERBOSE")) {
+                printf("\n  row %lld: cpu-vs-ref mismatches %lld, backend-vs-ref %lld; first ids ref/cpu/be:", (long long) r, (long long) ma, (long long) mb);
+                for (int c = 0; c < std::min(k, 12); c++) { printf(" %d/%d/%d", ref[c], (int) a[r * k + c], (int) b[r * k + c]); }
+                printf("\n");
+            }
+            bad += (ma > 0) + (mb > 0);
+        }
+        return bad;
+    }
+};
+
+static void add_clover_topk_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const clover_topk_pattern pats[] = { CTK_RANDOM, CTK_TIES_QUANT, CTK_TIES_DUP, CTK_MASKED, CTK_ZEROS, CTK_ZERO_SIGN, CTK_INF };
+    for (clover_topk_pattern p : pats) {
+        for (int64_t rows : { 1, 16, 256 }) {
+            for (int k : { 8, 256 }) {
+                test_cases.emplace_back(new test_clover_top_k({256, rows, 1, 1}, k, p, 7 + (uint32_t) p));
+            }
+        }
+    }
+    // other widths: register paths (32..1024), padded non-pow2, 4D batch
+    for (int64_t w : { 32, 64, 128, 512, 1024, 100, 240, 496 }) {
+        for (clover_topk_pattern p : { CTK_TIES_QUANT, CTK_MASKED }) {
+            test_cases.emplace_back(new test_clover_top_k({w, 16, 1, 1}, 8, p, 3));
+            test_cases.emplace_back(new test_clover_top_k({w, 3, 1, 1}, (int) std::min<int64_t>(w, 64), p, 4));
+        }
+    }
+    test_cases.emplace_back(new test_clover_top_k({256, 5, 3, 2}, 8, CTK_TIES_QUANT, 11));
+    test_cases.emplace_back(new test_clover_top_k({256, 16, 1, 1}, 8, CTK_DENORM, 5));
+    if (const char * fx = getenv("CLOVER_TOPK_FIXTURE")) {
+        std::stringstream ss(fx);
+        std::string path;
+        while (std::getline(ss, path, ';')) {
+            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            const int64_t n_rows = f.good() ? (int64_t) f.tellg() / (256 * (int64_t) sizeof(float)) : 0;
+            for (int64_t rows : { 1, 16, 256 }) {
+                for (int64_t off = 0; n_rows >= off + rows && off <= 3 * rows; off += rows) {
+                    for (int k : { 8, 256 }) {
+                        test_cases.emplace_back(new test_clover_top_k({256, rows, 1, 1}, k, CTK_FIXTURE, 1, path, off));
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void add_clover_topk_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t rows : { 1, 16, 256 }) {
+        for (int k : { 8, 256 }) {
+            test_cases.emplace_back(new test_clover_top_k({256, rows, 1, 1}, k, CTK_RANDOM, 1, "", 0, true));
+            test_cases.emplace_back(new test_clover_top_k({256, rows, 1, 1}, k, CTK_RANDOM, 1, "", 0, false));
+        }
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {256, rows, 1, 1}, GGML_SORT_ORDER_DESC));
+    }
+}
+// ---- END topk agent ----
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -12551,6 +12745,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // topk agent
+    add_clover_topk_eval_cases(test_cases);
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13099,6 +13296,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+
+    // topk agent
+    add_clover_topk_perf_cases(test_cases);
 
     return test_cases;
 }

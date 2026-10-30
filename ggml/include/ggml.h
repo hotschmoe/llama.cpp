@@ -2485,6 +2485,13 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // top k elements per row, sorted by value descending, ties -> lower index first (deterministic)
+    // backends that do not implement this must reject the op
+    GGML_API struct ggml_tensor * ggml_top_k_stable(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
