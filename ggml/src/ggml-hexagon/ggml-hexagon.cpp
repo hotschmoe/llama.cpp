@@ -85,6 +85,7 @@ int    opt_arch       = 0; // autodetect
 size_t opt_ndev       = 1;
 size_t opt_nhvx       = 0; // use all
 int    opt_nhmx       = 1; // when set, enable HMX; when 0, use HVX only
+int    opt_f32_hmx    = 1; // 1 = F32 weights tiled as fp16 for HMX, 0 = keep F32 weights in F32 (HVX F32 matmul)
 size_t opt_vtcm_size  = 0; // VTCM size override in bytes; 0 = auto-detect
 size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 int    opt_etm        = 0;
@@ -3414,6 +3415,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
     const char * str_power_mode = getenv("GGML_HEXAGON_POWER_MODE");
+    const char * str_f32_hmx  = getenv("GGML_HEXAGON_F32_HMX");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -3465,6 +3467,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
+    opt_f32_hmx   = str_f32_hmx  ? atoi(str_f32_hmx)                      : opt_f32_hmx;
     opt_vtcm_size = str_vtcm_size ? parse_size(str_vtcm_size)                 : opt_vtcm_size;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
