@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1503,6 +1504,25 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
     common_prompt_checkpoint checkpoint;
     std::vector<bool> needs_anchor;
 
+    // -1: not known yet, 0: the masked-block pass leaves the recurrent memory as it was (no checkpoint needed),
+    //  1: the pass advances it, so the recurrent state is checkpointed and restored around every pass
+    int ckpt_mode = -1;
+
+    // research knob (LLAMA_DRAFT_SELF_MARGIN, off by default): end the draft at the first position whose top-1 - top-2
+    // logit margin is below this value, so the verify forward only carries the confident prefix
+    float margin_min = -1.0f;
+
+    // per-phase wall time of the draft pass (us): checkpoint save, masked-block decode, argmax, restore
+    int64_t t_save_us = 0, t_decode_us = 0, t_argmax_us = 0, t_restore_us = 0;
+    int32_t n_passes  = 0;
+
+    ~common_speculative_impl_draft_self() override {
+        if (n_passes > 0) {
+            LOG_INF("draft-self prof: passes = %d, ckpt save = %.2f ms, decode = %.2f ms, argmax = %.2f ms, restore+seq_rm = %.2f ms (per pass)\n",
+                    n_passes, t_save_us / 1e3 / n_passes, t_decode_us / 1e3 / n_passes, t_argmax_us / 1e3 / n_passes, t_restore_us / 1e3 / n_passes);
+        }
+    }
+
     common_speculative_impl_draft_self(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SELF, n_seq, params.draft.n_max)
         , ctx(params.draft.ctx_tgt)
@@ -1516,6 +1536,13 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
         n_max = std::min(n_max, int32_t(std::min(llama_n_batch(ctx), llama_n_ubatch(ctx))) - 1);
         vocab = llama_model_get_vocab(llama_get_model(ctx));
         batch = common_batch(ctx);
+
+        if (const char * env = getenv("LLAMA_DRAFT_SELF_CKPT")) {
+            ckpt_mode = atoi(env) ? 1 : -1;
+        }
+        if (const char * env = getenv("LLAMA_DRAFT_SELF_MARGIN")) {
+            margin_min = (float) atof(env);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens &) override { needs_anchor[seq_id] = true; }
@@ -1541,27 +1568,65 @@ struct common_speculative_impl_draft_self : public common_speculative_impl {
 
             // Restore recurrent state before removing the temporary attention KV suffix,
             // using the same checkpoint mechanism as the caller's verification rollback.
-            checkpoint.update_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // Not needed when the non-causal pass only reads the recurrent state (see llm_arch_noncausal_keeps_rs).
+            int64_t t0 = ggml_time_us();
+            if (ckpt_mode != 0) {
+                checkpoint.update_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            int64_t t1 = ggml_time_us();
+            t_save_us += t1 - t0;
             batch.clear();
             common_speculative_add_masked_block(batch, dp, seq_id, llama_vocab_mask(vocab), n_max + 1, true);
 
             llama_set_causal_attn(ctx, false);
             const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             llama_set_causal_attn(ctx, true);
+            llama_synchronize(ctx);
+            t0 = ggml_time_us();
+            t_decode_us += t0 - t1;
+            n_passes++;
             if (ret == 0) {
+                const int n_vocab = llama_vocab_n_tokens(vocab);
                 for (int i = 0; i < count; ++i) {
                     const float * logits = llama_get_logits_ith(ctx, i + 1);
-                    const llama_token token = std::max_element(logits, logits + llama_vocab_n_tokens(vocab)) - logits;
+                    llama_token token;
+                    if (margin_min > 0.0f) {
+                        // first maximum, like std::max_element, plus the runner-up value
+                        float v1 = logits[0], v2 = -INFINITY;
+                        token = 0;
+                        for (int j = 1; j < n_vocab; ++j) {
+                            const float x = logits[j];
+                            if (x > v1) {
+                                v2 = v1; v1 = x; token = j;
+                            } else if (x > v2) {
+                                v2 = x;
+                            }
+                        }
+                        if (i > 0 && v1 - v2 < margin_min) {
+                            break;
+                        }
+                    } else {
+                        token = std::max_element(logits, logits + n_vocab) - logits;
+                    }
                     dp.result->push_back(token);
                     if (dp.result_q) {
                         dp.result_q->push_back({{token, 0.0f, 1.0f}});
                     }
                 }
             }
-            if (!checkpoint.load_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            t1 = ggml_time_us();
+            t_argmax_us += t1 - t0;
+            if (ckpt_mode < 0 && ret == 0) {
+                // the recurrent memory was left alone iff the sequence still ends right before the block
+                ckpt_mode = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) >= dp.pos0 ? 1 : 0;
+                SPC_TRC("draft-self: masked-block pass %s the recurrent state, %s\n",
+                        ckpt_mode ? "advances" : "keeps", ckpt_mode ? "checkpointing every pass" : "no checkpoint needed");
+            }
+            if ((ckpt_mode != 0 && !checkpoint.load_tgt(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) ||
                     !llama_memory_seq_rm(llama_get_memory(ctx), seq_id, dp.pos0, -1)) {
                 GGML_ABORT("failed to restore target state after self-drafting");
             }
+            t_restore_us += ggml_time_us() - t1;
             if (ret != 0) {
                 SPC_WRN("self-draft decode failed (%d); continuing without a draft\n", ret);
             }

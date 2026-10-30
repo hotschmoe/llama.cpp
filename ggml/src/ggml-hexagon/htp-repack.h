@@ -7,6 +7,10 @@
 #include "ggml.h"
 #include "htp/htp-tensor.h"
 
+// 1 = F32 weights are tiled as fp16 and run on HMX (default); 0 = keep F32 weights (e.g. MoE routers) in F32 and
+// use the HVX F32 kernel (GGML_HEXAGON_F32_HMX=0)
+extern int opt_f32_hmx;
+
 static inline bool htp_is_tiled_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_0  || type == GGML_TYPE_Q4_1   ||
            type == GGML_TYPE_Q8_0  || type == GGML_TYPE_IQ4_NL ||
@@ -15,7 +19,7 @@ static inline bool htp_is_tiled_weight_type(enum ggml_type type) {
            type == GGML_TYPE_Q4_K  || type == GGML_TYPE_Q5_K   ||
            type == GGML_TYPE_Q3_K  || type == GGML_TYPE_Q2_K   ||
            type == GGML_TYPE_Q2_0  ||
-           type == GGML_TYPE_F16   || type == GGML_TYPE_F32    ||
+           type == GGML_TYPE_F16   || (type == GGML_TYPE_F32 && opt_f32_hmx) ||
            type == GGML_TYPE_BF16;
 }
 

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -209,7 +210,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    // negative control for rollback exactness tests (off by default): install the state one token too late
+                    static const bool negctl = getenv("LLAMA_RS_ROLLBACK_NEGCTL") != nullptr;
+                    set_rs_idx(seq_id, (uint32_t) (negctl ? rollback - 1 : rollback));
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -428,6 +431,19 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+}
+
+llama_memory_recurrent::meta llama_memory_recurrent::meta_save() const {
+    return { cells, rs_idx, head, used, n, rs_z };
+}
+
+void llama_memory_recurrent::meta_restore(meta && m) {
+    cells  = std::move(m.cells);
+    rs_idx = std::move(m.rs_idx);
+    head   = m.head;
+    used   = m.used;
+    n      = m.n;
+    rs_z   = m.rs_z;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {

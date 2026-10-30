@@ -638,5 +638,13 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_ffn(ggml_tensor * cur, 
 }
 
 ggml_tensor * llama_model_clover_moe::graph::build_bf16_round(ggml_tensor * cur) const {
+    // SPOOF (trace agent, debug only, default off): LLAMA_CLOVER_NO_BF16_ROUND=1 drops every bf16 round trip
+    static const bool no_round = [] {
+        const char * v = getenv("LLAMA_CLOVER_NO_BF16_ROUND");
+        return v && atoi(v) != 0;
+    }();
+    if (no_round) {
+        return cur;
+    }
     return ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
 }

@@ -109,6 +109,19 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // cell metadata only (no state data): a pass that reads the states but never writes them restores this afterwards
+    struct meta {
+        std::vector<mem_cell> cells;
+        std::vector<uint32_t> rs_idx;
+        uint32_t head = 0;
+        uint32_t used = 0;
+        uint32_t n    = 0;
+        int32_t  rs_z = -1;
+    };
+
+    meta meta_save() const;
+    void meta_restore(meta && m);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;

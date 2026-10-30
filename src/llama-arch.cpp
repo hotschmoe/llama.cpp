@@ -1314,6 +1314,15 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_noncausal_keeps_rs(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_CLOVER_MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // these models pick weights, routing or input meaning per ubatch based on token vs embd input
 bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     switch (arch) {
