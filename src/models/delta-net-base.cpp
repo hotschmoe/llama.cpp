@@ -498,9 +498,14 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        // slot s = conv window s tokens back from the end of this ubatch. The GDN op only writes the ssm snapshots
+        // s < n_seq_tokens, so a valid rollback never reads a slot s >= n_seq_tokens: do not copy those
+        // (a 1-token decode writes 1 window instead of K)
+        const int64_t n_seq_tokens = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t n_written    = std::min<int64_t>(K, n_seq_tokens);
+
+        for (int64_t s_slot = 0; s_slot < n_written; ++s_slot) {
+            const int64_t s_idx = n_seq_tokens - s_slot;
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
